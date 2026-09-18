@@ -133,7 +133,7 @@ class TerminalDashboard:
         edge_text = "Edges: unavailable"
         if edge is not None:
             edge_text = (
-                f"Edges CAD/unit: buy ETF {edge.buy_etf_edge_cad:+.4f} | "
+                f"Net top edges CAD/unit: buy ETF {edge.buy_etf_edge_cad:+.4f} | "
                 f"sell ETF {edge.sell_etf_edge_cad:+.4f}"
             )
 
@@ -145,6 +145,8 @@ class TerminalDashboard:
         market_two = f"{self._book_text('RITC')}    {self._book_text('USD')}"
         execution = (
             f"Orders {len(self.state.orders)} | Tenders {len(self.state.tenders)} "
+            f"| Intents {len(self.state.active_intents())} "
+            f"| Bundles {len(self.state.bundles)} "
             f"| Hedge {self.state.hedge_remaining or '{}'}"
         )
 

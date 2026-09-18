@@ -35,15 +35,22 @@ class TenderEvaluation:
             "-" if self.exit_average_price is None
             else f"{self.exit_average_price:.4f}"
         )
+        economics = (
+            "economics=not evaluated"
+            if self.exit_average_price is None
+            else (
+                f"gross={self.gross_profit_usd:+.2f}USD "
+                f"fee={self.fees_usd:.2f} buffer={self.buffer_usd:.2f} | "
+                f"net={self.expected_profit_usd:+.2f}USD/"
+                f"{self.expected_profit_cad:+.2f}CAD "
+                f"edge={self.edge_per_share_usd:+.4f}USD"
+            )
+        )
         return (
             f"TENDER {self.tender_id} {verdict} | {self.action} "
             f"{self.quantity} RITC @{price} | exit {self.exit_action} "
             f"avg={average} depth={self.visible_quantity}/{self.quantity} | "
-            f"gross={self.gross_profit_usd:+.2f}USD "
-            f"fee={self.fees_usd:.2f} buffer={self.buffer_usd:.2f} | "
-            f"net={self.expected_profit_usd:+.2f}USD/"
-            f"{self.expected_profit_cad:+.2f}CAD "
-            f"edge={self.edge_per_share_usd:+.4f}USD | "
+            f"{economics} | "
             f"risk gross={self.projected_gross} net={self.projected_net} | "
             f"reason={self.reason}"
         )

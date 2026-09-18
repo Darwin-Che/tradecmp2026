@@ -81,6 +81,9 @@ class RITClient:
     def get_tenders(self):
         return self.request("GET", "tenders")
 
+    def get_limits(self):
+        return self.request("GET", "limits")
+
     def accept_tender(self, tender_id, price=None):
         if price is None:
             raise ValueError("A tender acceptance price is required by RIT API v1.0.4+")

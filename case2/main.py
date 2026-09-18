@@ -5,7 +5,7 @@ import signal
 import sys
 from time import sleep
 
-import _example as strategy
+import strategy
 from api import ApiException, RITClient
 from dashboard import TerminalDashboard
 
