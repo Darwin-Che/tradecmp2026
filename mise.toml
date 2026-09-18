@@ -1,0 +1,5 @@
+[env]
+RIT_USERNAME="goal"
+RIT_PASSWORD="credit"
+RIT_PRINT_DETAIL="summary"
+RIT_LOOP_SLEEP="0.5"
