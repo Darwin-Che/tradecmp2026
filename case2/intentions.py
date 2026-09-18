@@ -86,11 +86,22 @@ class TradeBundle:
     created_tick: int
     expected_profit_cad: float
     max_unhedged_ticks: int
+    quantity: int = 0
+    open_quantity: int = 0
+    closes_reason: Optional[str] = None
+    closes_bundle_id: Optional[str] = None
+    inventory_applied: bool = False
     gross_profit_cad: float = 0.0
     fees_cad: float = 0.0
     edge_per_share_cad: float = 0.0
     projected_gross: int = 0
     projected_net: int = 0
+    entry_residual_cad: Optional[float] = None
+    current_residual_cad: Optional[float] = None
+    convergence: Optional[float] = None
+    estimated_close_cad: Optional[float] = None
+    estimated_close_quantity: int = 0
+    estimated_round_trip_cad: Optional[float] = None
     intent_ids: List[str] = field(default_factory=list)
     status: str = "PLANNED"
     context: str = ""

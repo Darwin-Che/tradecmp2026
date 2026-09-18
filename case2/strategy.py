@@ -6,10 +6,12 @@ import sys
 
 from api import ApiException
 from arbitrage import best_arbitrage, evaluate_arbitrage
+from convergence import find_convergence_exit, market_residual, update_convergence
 from fulfillment import fulfill_intents
 from intentions import OrderIntent, TradeBundle
 from state import TenderState, TradingState
 from tender_strategy import evaluate_fixed_tender
+from valuation import liquidation_value_cad
 
 STATE = TradingState(history_limit=300)
 PROCESSED_TENDER_IDS = set()
@@ -33,12 +35,19 @@ MAX_GROSS     = 300000
 ORDER_QTY     = 5000    # child order size for arb legs
 RISK_LIMITS_LOADED = False
 
-ARB_MIN_NET_EDGE_CAD = 0.02
-ARB_MIN_PROFIT_CAD = 25.0
-INVENTORY_HIGH_WATERMARK = 0.80
-INVENTORY_TARGET = 0.65
+ARB_MIN_NET_EDGE_CAD = 0.05
+ARB_MIN_PROFIT_CAD = 150.0
 INVENTORY_MAX_CLOSE_COST_CAD = 0.08
-INVENTORY_PROFIT_SPEND_FRACTION = 0.50
+CONVERGENCE_EXIT_THRESHOLD = 0.75
+CONVERGENCE_MIN_ROUND_TRIP_CAD = 100.0
+PNL_THRESHOLDS_CAD = (10_000.0, 30_000.0, 60_000.0)
+PNL_GROSS_PROFILES = (
+    (0.80, 0.65),
+    (0.65, 0.50),
+    (0.50, 0.30),
+    (0.25, 0.10),
+)
+PNL_MAX_GIVEBACK_FRACTION = 0.20
 TENDER_BUFFER_USD = 0.03
 TENDER_MIN_PROFIT_CAD = 50.0
 TENDER_MAX_BOOK_AGE = 1.5
@@ -100,7 +109,7 @@ def get_order_book(client, ticker):
     )
 
 def positions_map(client):
-    # Tracks current positions (number of shares currently hold for a ticker/instrument), to help risk management
+    """Return current simulator positions, including currency cash balances."""
     data = client.get_securities()
     if data is None:
         return {k: 0 for k in (BULL, BEAR, RITC, USD, CAD)}
@@ -207,15 +216,30 @@ def equity_gross(positions):
     )
 
 
+def pnl_risk_profile():
+    """Return gross start/target fractions and drawdown state."""
+    pnl = STATE.pnl_cad
+    profile_index = sum(pnl >= threshold for threshold in PNL_THRESHOLDS_CAD)
+    drawdown_active = (
+        STATE.pnl_high_water_cad >= PNL_THRESHOLDS_CAD[0]
+        and pnl <= STATE.pnl_high_water_cad * (1 - PNL_MAX_GIVEBACK_FRACTION)
+    )
+    if drawdown_active:
+        profile_index = len(PNL_GROSS_PROFILES) - 1
+    start, target = PNL_GROSS_PROFILES[profile_index]
+    return start, target, drawdown_active
+
+
 def inventory_reduction_plan():
     """Plan a controlled reverse bundle when inventory consumes capacity."""
     gross = equity_gross(STATE.positions)
-    target_gross = int(MAX_GROSS * INVENTORY_TARGET)
+    start_fraction, target_fraction, _ = pnl_risk_profile()
+    target_gross = int(MAX_GROSS * target_fraction)
     reducing = STATE.strategy_status == "REDUCING_INVENTORY"
     if reducing and gross <= target_gross:
         STATE.strategy_status = "IDLE"
         return None
-    if not reducing and gross < MAX_GROSS * INVENTORY_HIGH_WATERMARK:
+    if not reducing and gross < MAX_GROSS * start_fraction:
         return None
 
     bull = STATE.positions.get(BULL, 0)
@@ -235,19 +259,13 @@ def inventory_reduction_plan():
     if max_quantity <= 0:
         return None
 
-    accumulated_profit = sum(
-        bundle.expected_profit_cad
-        for bundle in STATE.bundles.values()
-        if bundle.status == "FILLED"
-    )
-    spend_budget = max(0.0, accumulated_profit) * INVENTORY_PROFIT_SPEND_FRACTION
     plan = evaluate_arbitrage(
         STATE,
         direction,
         max_quantity=max_quantity,
         market_fee=FEE_MKT,
         minimum_net_edge_cad=-INVENTORY_MAX_CLOSE_COST_CAD,
-        minimum_profit_cad=-spend_budget,
+        minimum_profit_cad=float("-inf"),
         max_gross=MAX_GROSS,
         min_net=MAX_SHORT_NET,
         max_net=MAX_LONG_NET,
@@ -259,21 +277,38 @@ def inventory_reduction_plan():
     return replace(plan, reason=f"INVENTORY_REDUCE_{direction}")
 
 
-def enqueue_arb(plan):
+def enqueue_arb(plan, closes_bundle_id=None):
     """Create intentions from a depth, cost, and risk checked plan."""
     tick = STATE.case_tick or 0
     bundle_id = f"arb-{tick}-{len(STATE.bundles) + 1}"
+    is_opening = plan.reason.startswith("ETF_ARB_")
+    closes_reason = None
+    source = STATE.bundles.get(closes_bundle_id)
+    if source is not None:
+        closes_reason = source.reason
+    elif plan.reason.endswith("BUY_ETF") and not is_opening:
+        closes_reason = "ETF_ARB_SELL_ETF"
+    elif plan.reason.endswith("SELL_ETF") and not is_opening:
+        closes_reason = "ETF_ARB_BUY_ETF"
     bundle = STATE.add_bundle(TradeBundle(
         bundle_id=bundle_id,
         reason=plan.reason,
         created_tick=tick,
         expected_profit_cad=plan.expected_profit_cad,
         max_unhedged_ticks=2,
+        quantity=plan.quantity,
+        open_quantity=plan.quantity if is_opening else 0,
+        closes_reason=closes_reason,
+        closes_bundle_id=closes_bundle_id,
         gross_profit_cad=plan.gross_profit_cad,
         fees_cad=plan.fees_cad,
         edge_per_share_cad=plan.edge_per_share_cad,
         projected_gross=plan.projected_gross,
         projected_net=plan.projected_net,
+        entry_residual_cad=(
+            market_residual(STATE)
+            if is_opening else None
+        ),
         context=(
             f"tick={tick} net_edge={plan.edge_per_share_cad:.4f}CAD "
             f"planned_qty={plan.quantity}"
@@ -319,6 +354,23 @@ def step_once(client):
 
     pos = positions_map(client)
     STATE.update_positions(pos)
+    STATE.update_portfolio_value(
+        liquidation_value_cad(STATE.positions, STATE.current_books)
+    )
+    risk_start, risk_target, drawdown = pnl_risk_profile()
+    previous_profile = (
+        STATE.gross_start_fraction,
+        STATE.gross_target_fraction,
+        STATE.pnl_drawdown_active,
+    )
+    STATE.update_risk_profile(risk_start, risk_target, drawdown)
+    if previous_profile != (risk_start, risk_target, drawdown):
+        print(
+            f"RISK PROFILE | pnl={STATE.pnl_cad:+.2f}CAD "
+            f"high_water={STATE.pnl_high_water_cad:+.2f}CAD "
+            f"gross={risk_start:.0%}->{risk_target:.0%} "
+            f"drawdown={drawdown}"
+        )
     unfinished_bundle = any(
         bundle.status in ("HEDGING", "INCOMPLETE")
         for bundle in STATE.bundles.values()
@@ -361,6 +413,7 @@ def step_once(client):
     buy_etf_edge = gross_buy_etf_edge - fee_per_share_cad
     sell_etf_edge = gross_sell_etf_edge - fee_per_share_cad
     STATE.record_edges(buy_etf_edge, sell_etf_edge)
+    update_convergence(STATE, market_fee=FEE_MKT)
 
     created = False
     if not busy:
@@ -368,7 +421,27 @@ def step_once(client):
 
     if not busy and not created:
         gross = equity_gross(STATE.positions)
-        plan = inventory_reduction_plan()
+        closes_bundle_id = None
+        exit_choice = find_convergence_exit(
+            STATE,
+            minimum_convergence=CONVERGENCE_EXIT_THRESHOLD,
+            minimum_round_trip_cad=CONVERGENCE_MIN_ROUND_TRIP_CAD,
+            market_fee=FEE_MKT,
+            max_gross=MAX_GROSS,
+            min_net=MAX_SHORT_NET,
+            max_net=MAX_LONG_NET,
+        )
+        plan = None
+        if exit_choice is not None:
+            opening, plan, round_trip = exit_choice
+            closes_bundle_id = opening.bundle_id
+            print(
+                f"CONVERGENCE EXIT | source={opening.bundle_id} "
+                f"convergence={opening.convergence:.1%} "
+                f"qty={plan.quantity} round_trip={round_trip:+.2f}CAD"
+            )
+        if plan is None:
+            plan = inventory_reduction_plan()
         reducing = STATE.strategy_status == "REDUCING_INVENTORY"
         if plan is None:
             plan = best_arbitrage(
@@ -382,12 +455,12 @@ def step_once(client):
                 max_net=MAX_LONG_NET,
             )
             inventory_guard = (
-                reducing or gross >= MAX_GROSS * INVENTORY_HIGH_WATERMARK
+                reducing or gross >= MAX_GROSS * pnl_risk_profile()[0]
             )
             if plan and inventory_guard and plan.projected_gross >= gross:
                 plan = None
         if plan is not None:
-            enqueue_arb(plan)
+            enqueue_arb(plan, closes_bundle_id=closes_bundle_id)
             created = True
 
     submitted = fulfill_intents(

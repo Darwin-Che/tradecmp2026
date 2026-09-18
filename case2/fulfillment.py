@@ -67,6 +67,36 @@ def _prepare_bundles(state, current_tick):
     return ready
 
 
+def _apply_inventory_closes(state):
+    """Allocate completed closing bundles against oldest open entry lots."""
+    for closing in state.bundles.values():
+        if (
+            closing.status != "FILLED"
+            or not closing.closes_reason
+            or closing.inventory_applied
+        ):
+            continue
+        remaining = closing.quantity
+        if closing.closes_bundle_id:
+            target = state.bundles.get(closing.closes_bundle_id)
+            openings = [target] if target is not None else []
+        else:
+            openings = state.bundles.values()
+        for opening in openings:
+            if remaining <= 0:
+                break
+            if opening.reason != closing.closes_reason or opening.status != "FILLED":
+                continue
+            closed = min(remaining, opening.open_quantity)
+            opening.open_quantity -= closed
+            remaining -= closed
+        closing.inventory_applied = True
+        print(
+            f"BUNDLE INVENTORY | id={closing.bundle_id} "
+            f"closed={closing.quantity - remaining}/{closing.quantity}"
+        )
+
+
 def fulfill_intents(client, state, max_order_size=10_000, fee_per_share=0.02):
     """Execute intentions while preserving bundle hedge obligations."""
     current_tick = state.case_tick if state.case_tick is not None else 0
@@ -144,4 +174,5 @@ def fulfill_intents(client, state, max_order_size=10_000, fee_per_share=0.02):
             bundle.status = "PLANNED"
         elif members and bundle.status != "CANCELLED":
             bundle.status = "INCOMPLETE"
+    _apply_inventory_closes(state)
     return submitted

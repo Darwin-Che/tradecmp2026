@@ -170,6 +170,13 @@ class TradingState:
     strategy_status: str = "IDLE"
     case_tick: Optional[int] = None
     case_status: Optional[str] = None
+    pnl_cad: float = 0.0
+    pnl_high_water_cad: float = 0.0
+    portfolio_value_cad: Optional[float] = None
+    portfolio_baseline_cad: Optional[float] = None
+    gross_start_fraction: float = 0.80
+    gross_target_fraction: float = 0.65
+    pnl_drawdown_active: bool = False
 
     def __post_init__(self):
         if self.history_limit <= 0:
@@ -209,6 +216,23 @@ class TradingState:
     def update_case(self, tick, status):
         self.case_tick = tick
         self.case_status = status
+
+    def update_pnl(self, pnl_cad):
+        self.pnl_cad = float(pnl_cad)
+        self.pnl_high_water_cad = max(self.pnl_high_water_cad, self.pnl_cad)
+
+    def update_portfolio_value(self, value_cad):
+        if value_cad is None:
+            return
+        self.portfolio_value_cad = float(value_cad)
+        if self.portfolio_baseline_cad is None:
+            self.portfolio_baseline_cad = self.portfolio_value_cad
+        self.update_pnl(self.portfolio_value_cad - self.portfolio_baseline_cad)
+
+    def update_risk_profile(self, start, target, drawdown_active=False):
+        self.gross_start_fraction = float(start)
+        self.gross_target_fraction = float(target)
+        self.pnl_drawdown_active = bool(drawdown_active)
 
     def add_intent(self, intent):
         if intent.intent_id in self.intents:
@@ -250,7 +274,11 @@ class TradingState:
         )
         header = (
             f"tick={self.case_tick} case={self.case_status} "
-            f"strategy={self.strategy_status} | {positions} | {edge_text}"
+            f"strategy={self.strategy_status} | {positions} | "
+            f"pnl={self.pnl_cad:+.2f}CAD "
+            f"high={self.pnl_high_water_cad:+.2f}CAD "
+            f"risk={self.gross_start_fraction:.0%}->{self.gross_target_fraction:.0%} "
+            f"drawdown={self.pnl_drawdown_active} | {edge_text}"
         )
         if detail == 0:
             return header
@@ -275,6 +303,27 @@ class TradingState:
             f"intents={len(self.active_intents())} bundles={len(self.bundles)} "
             f"hedge_remaining={self.hedge_remaining or '{}'}"
         )
+        open_lots = [
+            bundle for bundle in self.bundles.values()
+            if bundle.status == "FILLED" and bundle.open_quantity > 0
+        ]
+        if open_lots:
+            latest = open_lots[-1]
+            convergence = (
+                "-" if latest.convergence is None
+                else f"{latest.convergence:.1%}"
+            )
+            round_trip = (
+                "-" if latest.estimated_round_trip_cad is None
+                else f"{latest.estimated_round_trip_cad:+.2f}CAD"
+            )
+            lines.append(
+                f"Convergence: open_lots={len(open_lots)} "
+                f"open_qty={sum(item.open_quantity for item in open_lots)} "
+                f"latest={convergence} round_trip={round_trip}"
+            )
+        else:
+            lines.append("Convergence: no open arbitrage lots")
         if detail == 1:
             return "\n".join(lines)
 
