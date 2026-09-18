@@ -41,7 +41,7 @@ and maximize returns.
 # Client REST API, which is why the case logic below is unchanged.
 # ============================================================================
 
-API_ENDPOINT = "http://flserver.rotman.utoronto.ca:16655/v1"
+API_ENDPOINT = "http://flserver.rotman.utoronto.ca:16635/v1"
 USERNAME = "goal"
 PASSWORD = "credit"
 AUTHORIZATION = {'Authorization': 'Basic ' + base64.b64encode(f"{USERNAME}:{PASSWORD}".encode()).decode()}
