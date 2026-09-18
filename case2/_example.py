@@ -4,6 +4,9 @@ Rotman BMO Finance Research and Trading Lab, University of Toronto (C)
 All rights reserved.
 """
 
+import sys
+
+from api import ApiException
 from state import TradingState
 
 '''
@@ -21,6 +24,7 @@ and maximize returns.
 '''
 
 STATE = TradingState(history_limit=300)
+PROCESSED_TENDER_IDS = set()
 
 
 # Tickers
@@ -99,18 +103,40 @@ def within_limits(pos):
     return (gross < MAX_GROSS) and (MAX_SHORT_NET < net < MAX_LONG_NET)
 
 def accept_active_tender_offers(client):
-    # Retrieve active tender offers from the RIT API, and accept the offer
+    # This baseline only knows how to accept fixed-price tenders.
     offers = client.get_tenders()
     if not offers:
-        print("No active tenders")
-        return
-    tender_id = offers[0]['tender_id']
-    price = offers[0]['price']
-    if offers[0]['is_fixed_bid']:
-        resp = client.accept_tender(tender_id)
-    else:
-        resp = client.accept_tender(tender_id, price)
-    print("Tender Offer Accepted:", resp is not None)
+        return False
+
+    offer = next(
+        (item for item in offers if item["tender_id"] not in PROCESSED_TENDER_IDS),
+        None,
+    )
+    if offer is None:
+        return False
+
+    tender_id = offer["tender_id"]
+    price = offer.get("price")
+    if not offer.get("is_fixed_bid") or price is None:
+        PROCESSED_TENDER_IDS.add(tender_id)
+        print(
+            f"Skipping competitive tender {tender_id}: bid pricing is not implemented."
+        )
+        return False
+
+    try:
+        response = client.accept_tender(tender_id, price)
+    except ApiException as exc:
+        PROCESSED_TENDER_IDS.add(tender_id)
+        print(f"Tender {tender_id} failed: {exc}", file=sys.stderr)
+        return False
+
+    PROCESSED_TENDER_IDS.add(tender_id)
+    accepted = bool(response and response.get("success", True))
+    print(
+        f"Tender {tender_id} accepted at {float(price):.4f}: {accepted}"
+    )
+    return accepted
 
 # --------- CORE LOGIC ----------
 def step_once(client):

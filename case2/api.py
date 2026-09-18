@@ -82,8 +82,13 @@ class RITClient:
         return self.request("GET", "tenders")
 
     def accept_tender(self, tender_id, price=None):
-        params = None if price is None else {"price": price}
-        return self.request("POST", f"tenders/{tender_id}", params)
+        if price is None:
+            raise ValueError("A tender acceptance price is required by RIT API v1.0.4+")
+        return self.request(
+            "POST",
+            f"tenders/{tender_id}",
+            {"price": float(price)},
+        )
 
     def place_order(
         self,

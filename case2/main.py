@@ -2,6 +2,7 @@
 
 import os
 import signal
+import sys
 from time import sleep
 
 import _example as strategy
@@ -48,7 +49,7 @@ def run(client, strategy_module=strategy, loop_sleep=LOOP_SLEEP,
             tick, status = strategy_module.get_tick_status(client)
             strategy_module.STATE.update_case(tick, status)
         except ApiException as exc:
-            print(f"API error: {exc}")
+            print(f"API error: {exc}", file=sys.stderr)
             sleep(1)
     display_state()
 
