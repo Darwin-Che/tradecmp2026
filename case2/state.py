@@ -125,6 +125,8 @@ class OrderState:
     price: Optional[float] = None
     filled: int = 0
     status: str = "OPEN"
+    reason: str = ""
+    context: str = ""
 
     @property
     def remaining(self):
