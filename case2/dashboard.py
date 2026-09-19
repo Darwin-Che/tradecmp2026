@@ -133,7 +133,7 @@ class TerminalDashboard:
         edge_text = "Edges: unavailable"
         if edge is not None:
             edge_text = (
-                f"Edges CAD/unit: buy ETF {edge.buy_etf_edge_cad:+.4f} | "
+                f"Net top edges CAD/unit: buy ETF {edge.buy_etf_edge_cad:+.4f} | "
                 f"sell ETF {edge.sell_etf_edge_cad:+.4f}"
             )
 
@@ -145,8 +145,27 @@ class TerminalDashboard:
         market_two = f"{self._book_text('RITC')}    {self._book_text('USD')}"
         execution = (
             f"Orders {len(self.state.orders)} | Tenders {len(self.state.tenders)} "
+            f"| Intents {len(self.state.active_intents())} "
+            f"| Bundles {len(self.state.bundles)} "
             f"| Hedge {self.state.hedge_remaining or '{}'}"
         )
+        open_lots = [
+            bundle for bundle in self.state.bundles.values()
+            if bundle.status == "FILLED" and bundle.open_quantity > 0
+        ]
+        convergence = "Convergence: no open arbitrage lots"
+        if open_lots:
+            latest = open_lots[-1]
+            percent = "-" if latest.convergence is None else f"{latest.convergence:.1%}"
+            round_trip = (
+                "-" if latest.estimated_round_trip_cad is None
+                else f"{latest.estimated_round_trip_cad:+.2f}CAD"
+            )
+            convergence = (
+                f"Convergence: {len(open_lots)} lots / "
+                f"{sum(item.open_quantity for item in open_lots)} shares | "
+                f"latest {percent} | round trip {round_trip}"
+            )
 
         return [
             border,
@@ -155,9 +174,17 @@ class TerminalDashboard:
                 f"case {self.state.case_status} | {self.state.strategy_status}"
             ),
             row(f"Positions: {positions}"),
+            row(
+                f"Marked P&L CAD: {self.state.pnl_cad:+.2f} | "
+                f"high water {self.state.pnl_high_water_cad:+.2f} | "
+                f"gross {self.state.gross_start_fraction:.0%}->"
+                f"{self.state.gross_target_fraction:.0%} | "
+                f"drawdown {self.state.pnl_drawdown_active}"
+            ),
             row(edge_text),
             row(market_one),
             row(market_two),
             row(execution),
+            row(convergence),
             border,
         ]

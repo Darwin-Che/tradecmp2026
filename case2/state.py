@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from time import time
 from typing import Deque, Dict, Iterable, Optional, Tuple
 
+from intentions import OrderIntent, TradeBundle, active_intents
+
 
 INSTRUMENTS = ("BULL", "BEAR", "RITC", "USD", "CAD")
 MARKET_TICKERS = ("BULL", "BEAR", "RITC", "USD")
@@ -125,6 +127,10 @@ class OrderState:
     price: Optional[float] = None
     filled: int = 0
     status: str = "OPEN"
+    reason: str = ""
+    context: str = ""
+    vwap: Optional[float] = None
+    fee_per_share: Optional[float] = None
 
     @property
     def remaining(self):
@@ -141,6 +147,10 @@ class TenderState:
     quantity: int
     accepted: bool = False
     quantity_unwound: int = 0
+    route: str = "DIRECT"
+    direct_quantity: int = 0
+    basket_quantity: int = 0
+    intent_ids: Tuple[str, ...] = ()
 
     @property
     def remaining_to_unwind(self):
@@ -160,10 +170,19 @@ class TradingState:
     )
     orders: Dict[int, OrderState] = field(default_factory=dict)
     tenders: Dict[int, TenderState] = field(default_factory=dict)
+    intents: Dict[str, OrderIntent] = field(default_factory=dict)
+    bundles: Dict[str, TradeBundle] = field(default_factory=dict)
     hedge_remaining: Dict[str, int] = field(default_factory=dict)
     strategy_status: str = "IDLE"
     case_tick: Optional[int] = None
     case_status: Optional[str] = None
+    pnl_cad: float = 0.0
+    pnl_high_water_cad: float = 0.0
+    portfolio_value_cad: Optional[float] = None
+    portfolio_baseline_cad: Optional[float] = None
+    gross_start_fraction: float = 0.80
+    gross_target_fraction: float = 0.65
+    pnl_drawdown_active: bool = False
 
     def __post_init__(self):
         if self.history_limit <= 0:
@@ -204,6 +223,38 @@ class TradingState:
         self.case_tick = tick
         self.case_status = status
 
+    def update_pnl(self, pnl_cad):
+        self.pnl_cad = float(pnl_cad)
+        self.pnl_high_water_cad = max(self.pnl_high_water_cad, self.pnl_cad)
+
+    def update_portfolio_value(self, value_cad):
+        if value_cad is None:
+            return
+        self.portfolio_value_cad = float(value_cad)
+        if self.portfolio_baseline_cad is None:
+            self.portfolio_baseline_cad = self.portfolio_value_cad
+        self.update_pnl(self.portfolio_value_cad - self.portfolio_baseline_cad)
+
+    def update_risk_profile(self, start, target, drawdown_active=False):
+        self.gross_start_fraction = float(start)
+        self.gross_target_fraction = float(target)
+        self.pnl_drawdown_active = bool(drawdown_active)
+
+    def add_intent(self, intent):
+        if intent.intent_id in self.intents:
+            raise ValueError(f"duplicate intent_id: {intent.intent_id}")
+        self.intents[intent.intent_id] = intent
+        return intent
+
+    def add_bundle(self, bundle):
+        if bundle.bundle_id in self.bundles:
+            raise ValueError(f"duplicate bundle_id: {bundle.bundle_id}")
+        self.bundles[bundle.bundle_id] = bundle
+        return bundle
+
+    def active_intents(self):
+        return active_intents(self.intents)
+
     def format_state(self, detail=1):
         """Return a readable state report at compact, summary, or full detail."""
         levels = {"compact": 0, "summary": 1, "full": 2}
@@ -223,13 +274,17 @@ class TradingState:
             "edges=unavailable"
             if latest_edge is None
             else (
-                f"buy_etf={latest_edge.buy_etf_edge_cad:+.4f}CAD "
-                f"sell_etf={latest_edge.sell_etf_edge_cad:+.4f}CAD"
+                f"net_buy_etf={latest_edge.buy_etf_edge_cad:+.4f}CAD "
+                f"net_sell_etf={latest_edge.sell_etf_edge_cad:+.4f}CAD"
             )
         )
         header = (
             f"tick={self.case_tick} case={self.case_status} "
-            f"strategy={self.strategy_status} | {positions} | {edge_text}"
+            f"strategy={self.strategy_status} | {positions} | "
+            f"pnl={self.pnl_cad:+.2f}CAD "
+            f"high={self.pnl_high_water_cad:+.2f}CAD "
+            f"risk={self.gross_start_fraction:.0%}->{self.gross_target_fraction:.0%} "
+            f"drawdown={self.pnl_drawdown_active} | {edge_text}"
         )
         if detail == 0:
             return header
@@ -251,8 +306,30 @@ class TradingState:
 
         lines.append(
             f"Execution: orders={len(self.orders)} tenders={len(self.tenders)} "
+            f"intents={len(self.active_intents())} bundles={len(self.bundles)} "
             f"hedge_remaining={self.hedge_remaining or '{}'}"
         )
+        open_lots = [
+            bundle for bundle in self.bundles.values()
+            if bundle.status == "FILLED" and bundle.open_quantity > 0
+        ]
+        if open_lots:
+            latest = open_lots[-1]
+            convergence = (
+                "-" if latest.convergence is None
+                else f"{latest.convergence:.1%}"
+            )
+            round_trip = (
+                "-" if latest.estimated_round_trip_cad is None
+                else f"{latest.estimated_round_trip_cad:+.2f}CAD"
+            )
+            lines.append(
+                f"Convergence: open_lots={len(open_lots)} "
+                f"open_qty={sum(item.open_quantity for item in open_lots)} "
+                f"latest={convergence} round_trip={round_trip}"
+            )
+        else:
+            lines.append("Convergence: no open arbitrage lots")
         if detail == 1:
             return "\n".join(lines)
 
@@ -281,13 +358,25 @@ class TradingState:
         else:
             lines.append("  none")
 
+        lines.append("Intentions:")
+        if self.intents:
+            lines.extend(f"  {intent}" for intent in self.intents.values())
+        else:
+            lines.append("  none")
+
+        lines.append("Trade bundles:")
+        if self.bundles:
+            lines.extend(f"  {bundle}" for bundle in self.bundles.values())
+        else:
+            lines.append("  none")
+
         lines.append("Recent edges:")
         if self.edge_history:
             for edge in list(self.edge_history)[-5:]:
                 lines.append(
                     f"  t={edge.timestamp:.3f} "
-                    f"buy_etf={edge.buy_etf_edge_cad:+.4f}CAD "
-                    f"sell_etf={edge.sell_etf_edge_cad:+.4f}CAD"
+                    f"net_buy_etf={edge.buy_etf_edge_cad:+.4f}CAD "
+                    f"net_sell_etf={edge.sell_etf_edge_cad:+.4f}CAD"
                 )
         else:
             lines.append("  none")
