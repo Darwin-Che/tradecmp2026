@@ -2,6 +2,8 @@
 
 import sys
 
+from completion_log import log_completed_bundles
+from event_log import order_detail
 from execution import submit_market_order
 
 
@@ -96,7 +98,8 @@ def _apply_inventory_closes(state):
         closing.inventory_applied = True
         print(
             f"BUNDLE INVENTORY | id={closing.bundle_id} "
-            f"closed={closing.quantity - remaining}/{closing.quantity}"
+            f"matched_arb_lots={closing.quantity - remaining}/{closing.quantity} "
+            f"unmatched={remaining} (positions already filled)"
         )
 
 
@@ -161,7 +164,7 @@ def fulfill_market_intents(client, state, max_order_size=10_000, fee_per_share=0
             state.positions[intent.ticker] += position_delta
         elif bundle and not _bundle_started(members):
             blocked_bundles.add(bundle.bundle_id)
-        print(
+        order_detail(
             f"INTENT PROGRESS | id={intent.intent_id} status={intent.status} "
             f"filled={intent.filled_quantity}/{abs(intent.quantity)} "
             f"remaining={intent.remaining:+d}"
@@ -178,6 +181,7 @@ def fulfill_market_intents(client, state, max_order_size=10_000, fee_per_share=0
         elif members and bundle.status != "CANCELLED":
             bundle.status = "INCOMPLETE"
     _apply_inventory_closes(state)
+    log_completed_bundles(state)
     return submitted
 
 

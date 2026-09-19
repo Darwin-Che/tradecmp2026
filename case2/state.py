@@ -129,6 +129,8 @@ class OrderState:
     status: str = "OPEN"
     reason: str = ""
     context: str = ""
+    vwap: Optional[float] = None
+    fee_per_share: Optional[float] = None
 
     @property
     def remaining(self):

@@ -2,6 +2,9 @@
 
 import unittest
 import sys
+import io
+from contextlib import redirect_stdout
+from unittest.mock import patch
 from types import ModuleType
 
 try:
@@ -87,6 +90,24 @@ class FakeLimitClient(FakeMarketClient):
 
 
 class ExecutionPolicyTests(unittest.TestCase):
+    def test_default_order_log_is_compact_and_completion_is_once(self):
+        state = arb_state()
+        output = io.StringIO()
+        with patch.dict("os.environ", {"RIT_VERBOSE_ORDERS": "0"}), redirect_stdout(output):
+            fulfill_intents(FakeMarketClient(), state, policy="market")
+            fulfill_intents(FakeMarketClient(), state, policy="market")
+        self.assertEqual(output.getvalue().count("BUNDLE COMPLETE |"), 1)
+        self.assertNotIn("ORDER SUBMIT |", output.getvalue())
+        self.assertNotIn("ORDER FILL |", output.getvalue())
+        self.assertIn("fee_est=4.00CAD+2.00USD", output.getvalue())
+
+    def test_verbose_order_log_restores_child_order_detail(self):
+        output = io.StringIO()
+        with patch.dict("os.environ", {"RIT_VERBOSE_ORDERS": "1"}), redirect_stdout(output):
+            fulfill_intents(FakeMarketClient(), arb_state(), policy="market")
+        self.assertEqual(output.getvalue().count("ORDER SUBMIT |"), 3)
+        self.assertEqual(output.getvalue().count("ORDER FILL |"), 3)
+
     def test_market_policy_only_submits_market_orders(self):
         state = arb_state()
         client = FakeMarketClient()

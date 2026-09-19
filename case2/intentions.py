@@ -108,6 +108,7 @@ class TradeBundle:
     intent_ids: List[str] = field(default_factory=list)
     status: str = "PLANNED"
     context: str = ""
+    completion_logged: bool = False
 
     def __post_init__(self):
         if self.max_unhedged_ticks < 0:

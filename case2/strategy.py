@@ -12,10 +12,11 @@ from fulfillment import fulfill_intents
 from intentions import OrderIntent, TradeBundle
 from state import TenderState, TradingState
 from tender_strategy import evaluate_fixed_tender
-from valuation import liquidation_value_cad
+from valuation import liquidation_components_cad, liquidation_value_cad
 
 STATE = TradingState(history_limit=300)
 ACCEPTED_TENDER_IDS = set()
+LOGGED_TENDER_REJECTIONS = set()
 
 
 def reset_for_new_heat():
@@ -23,6 +24,7 @@ def reset_for_new_heat():
     global STATE, RISK_LIMITS_LOADED, MAX_GROSS, MAX_LONG_NET, MAX_SHORT_NET
     STATE = TradingState(history_limit=STATE.history_limit)
     ACCEPTED_TENDER_IDS.clear()
+    LOGGED_TENDER_REJECTIONS.clear()
     RISK_LIMITS_LOADED = False
     MAX_GROSS = DEFAULT_MAX_GROSS
     MAX_LONG_NET = DEFAULT_MAX_LONG_NET
@@ -169,7 +171,14 @@ def accept_active_tender_offers(client):
             min_net=MAX_SHORT_NET,
             max_net=MAX_LONG_NET,
         )
-        print(evaluation.log_line())
+        decision_line = evaluation.log_line()
+        if evaluation.should_accept:
+            print(decision_line)
+        elif (os.getenv("RIT_VERBOSE_REJECTIONS", "0").lower()
+              in ("1", "true", "yes")
+              or decision_line not in LOGGED_TENDER_REJECTIONS):
+            print(decision_line)
+            LOGGED_TENDER_REJECTIONS.add(decision_line)
         if evaluation.should_accept:
             candidates.append(evaluation)
     if not candidates:
@@ -430,11 +439,21 @@ def step_once(client):
     )
     STATE.update_risk_profile(risk_start, risk_target, drawdown)
     if previous_profile != (risk_start, risk_target, drawdown):
+        mark = liquidation_components_cad(STATE.positions, STATE.current_books)
+        mark_text = (
+            "unavailable" if mark is None else
+            f"cash={mark['cash_cad']:+.2f} bull={mark['bull']:+.2f} "
+            f"bear={mark['bear']:+.2f} usd_block={mark['usd_block']:+.2f}"
+        )
         print(
-            f"RISK PROFILE | pnl={STATE.pnl_cad:+.2f}CAD "
+            f"RISK PROFILE | tick={STATE.case_tick} pnl={STATE.pnl_cad:+.2f}CAD "
             f"high_water={STATE.pnl_high_water_cad:+.2f}CAD "
+            f"giveback_trigger={STATE.pnl_high_water_cad * (1 - PNL_MAX_GIVEBACK_FRACTION):+.2f}CAD "
+            f"giveback_eligible={STATE.pnl_high_water_cad >= PNL_THRESHOLDS_CAD[0]} "
+            f"gross_now={equity_gross(STATE.positions)}/{MAX_GROSS} "
             f"gross={risk_start:.0%}->{risk_target:.0%} "
-            f"drawdown={drawdown}"
+            f"gross_band={int(MAX_GROSS * risk_start)}->{int(MAX_GROSS * risk_target)} "
+            f"drawdown={drawdown} mark=[{mark_text}]"
         )
     unfinished_bundle = any(
         bundle.status in ("HEDGING", "INCOMPLETE")

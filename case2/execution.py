@@ -3,6 +3,7 @@
 import sys
 
 from state import OrderState
+from event_log import order_detail
 
 
 def submit_market_order(
@@ -18,7 +19,7 @@ def submit_market_order(
     """Submit one market order and log both its intent and API result."""
     quantity = int(quantity)
     context_text = f" {context}" if context else ""
-    print(
+    order_detail(
         f"ORDER SUBMIT | reason={reason}{context_text} | "
         f"{ticker} {action} qty={quantity} type=MARKET"
     )
@@ -56,14 +57,20 @@ def submit_market_order(
             status=status,
             reason=reason,
             context=context,
+            vwap=float(vwap) if vwap is not None else None,
+            fee_per_share=fee_per_share,
         )
 
-    print(
+    message = (
         f"ORDER FILL | order={order_id} reason={reason}{context_text} | "
         f"{ticker} {action} requested={quantity} filled={filled} "
         f"vwap={vwap_text} status={status} "
         f"commission={commission:.2f}{currency}"
     )
+    if filled != quantity or status not in ("TRANSACTED", "FILLED"):
+        print(message)
+    else:
+        order_detail(message)
     return response
 
 
@@ -79,7 +86,7 @@ def submit_limit_order(
 ):
     """Submit a limit order; fills remain subject to later reconciliation."""
     quantity = int(quantity)
-    print(
+    order_detail(
         f"ORDER SUBMIT | reason={reason} {context} | "
         f"{ticker} {action} qty={quantity} type=LIMIT price={price:.4f}"
     )
@@ -105,5 +112,6 @@ def submit_limit_order(
             status=response.get("status", "UNKNOWN"),
             reason=reason,
             context=context,
+            vwap=(float(response["vwap"]) if response.get("vwap") is not None else None),
         )
     return response

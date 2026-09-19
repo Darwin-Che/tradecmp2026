@@ -2,6 +2,8 @@
 
 import unittest
 import sys
+import io
+from contextlib import redirect_stdout
 from types import ModuleType, SimpleNamespace
 
 # The pure strategy tests do not instantiate the HTTP client. Keep them runnable
@@ -68,6 +70,22 @@ class FakeClient:
 
 
 class TenderRouteTests(unittest.TestCase):
+    def test_identical_rejections_are_logged_once_by_default(self):
+        original_state = strategy.STATE
+        original_rejections = strategy.LOGGED_TENDER_REJECTIONS
+        try:
+            strategy.STATE = market_state()
+            strategy.LOGGED_TENDER_REJECTIONS = set()
+            client = FakeClient([offer(price=27.0, tender_id=71)])
+            output = io.StringIO()
+            with redirect_stdout(output):
+                strategy.accept_active_tender_offers(client)
+                strategy.accept_active_tender_offers(client)
+            self.assertEqual(output.getvalue().count("TENDER 71 REJECT |"), 1)
+        finally:
+            strategy.STATE = original_state
+            strategy.LOGGED_TENDER_REJECTIONS = original_rejections
+
     def evaluate(self, item, state=None, **kwargs):
         return evaluate_fixed_tender(
             item,

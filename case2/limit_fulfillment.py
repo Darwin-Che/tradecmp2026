@@ -1,6 +1,8 @@
 """Passive-first execution with reconciled, marketable-limit hedging."""
 
 from api import ApiException
+from completion_log import log_completed_bundles
+from event_log import order_detail
 from execution import submit_limit_order
 from fulfillment import (
     _acceptable_quantity,
@@ -20,7 +22,7 @@ def _record_fill(state, intent, quantity):
         return
     intent.record_fill(quantity)
     state.positions[intent.ticker] += quantity if intent.action == "BUY" else -quantity
-    print(
+    order_detail(
         f"INTENT PROGRESS | id={intent.intent_id} "
         f"filled={intent.filled_quantity}/{abs(intent.quantity)} "
         f"remaining={intent.remaining:+d}"
@@ -42,7 +44,14 @@ def _reconcile(client, state, intent):
     delta = filled - order.filled
     if delta:
         _record_fill(state, intent, delta)
+        if filled < order.quantity:
+            print(
+                f"ORDER PARTIAL | order={order_id} intent={intent.intent_id} "
+                f"filled={filled}/{order.quantity}"
+            )
     order.filled = filled
+    if snapshot.get("vwap") is not None:
+        order.vwap = float(snapshot["vwap"])
     order.status = str(snapshot.get("status", order.status)).upper()
     if order.status in TERMINAL_ORDER_STATUSES or filled == order.quantity:
         intent.live_order_id = None
@@ -96,6 +105,11 @@ def _post_limit(client, state, intent, quantity, price, mode, current_tick):
     immediate_fill = order.filled
     if immediate_fill:
         _record_fill(state, intent, immediate_fill)
+        if immediate_fill < order.quantity:
+            print(
+                f"ORDER PARTIAL | order={order_id} intent={intent.intent_id} "
+                f"filled={immediate_fill}/{order.quantity}"
+            )
     order.status = str(order.status).upper()
     if order.status not in TERMINAL_ORDER_STATUSES:
         intent.live_order_id = order_id
@@ -224,4 +238,5 @@ def fulfill_limit_intents(
         elif members and bundle.status != "CANCELLED":
             bundle.status = "INCOMPLETE"
     _apply_inventory_closes(state)
+    log_completed_bundles(state)
     return submitted
