@@ -14,7 +14,7 @@ from tender_strategy import evaluate_fixed_tender
 from valuation import liquidation_value_cad
 
 STATE = TradingState(history_limit=300)
-PROCESSED_TENDER_IDS = set()
+ACCEPTED_TENDER_IDS = set()
 
 
 # Tickers
@@ -119,34 +119,36 @@ def positions_map(client):
     return out
 
 def accept_active_tender_offers(client):
-    # Evaluate each tender once; accept only profitable fixed-price offers.
+    # Re-evaluate rejected tenders while they remain live.
     offers = client.get_tenders()
     if not offers:
         return False
 
-    offer = next(
-        (item for item in offers if item["tender_id"] not in PROCESSED_TENDER_IDS),
-        None,
-    )
-    if offer is None:
+    candidates = []
+    for offer in offers:
+        tender_id = offer["tender_id"]
+        if tender_id in ACCEPTED_TENDER_IDS:
+            continue
+        evaluation = evaluate_fixed_tender(
+            offer,
+            STATE,
+            market_fee_usd=FEE_MKT,
+            stock_market_fee_cad=FEE_MKT,
+            safety_buffer_per_share_usd=TENDER_BUFFER_USD,
+            minimum_profit_cad=TENDER_MIN_PROFIT_CAD,
+            max_book_age_seconds=TENDER_MAX_BOOK_AGE,
+            max_gross=MAX_GROSS,
+            min_net=MAX_SHORT_NET,
+            max_net=MAX_LONG_NET,
+        )
+        print(evaluation.log_line())
+        if evaluation.should_accept:
+            candidates.append(evaluation)
+    if not candidates:
         return False
 
-    tender_id = offer["tender_id"]
-    evaluation = evaluate_fixed_tender(
-        offer,
-        STATE,
-        market_fee_usd=FEE_MKT,
-        safety_buffer_per_share_usd=TENDER_BUFFER_USD,
-        minimum_profit_cad=TENDER_MIN_PROFIT_CAD,
-        max_book_age_seconds=TENDER_MAX_BOOK_AGE,
-        max_gross=MAX_GROSS,
-        min_net=MAX_SHORT_NET,
-        max_net=MAX_LONG_NET,
-    )
-    PROCESSED_TENDER_IDS.add(tender_id)
-    print(evaluation.log_line())
-    if not evaluation.should_accept:
-        return False
+    evaluation = max(candidates, key=lambda item: item.expected_profit_cad)
+    tender_id = evaluation.tender_id
 
     try:
         response = client.accept_tender(tender_id, evaluation.tender_price)
@@ -159,53 +161,88 @@ def accept_active_tender_offers(client):
         print(f"Tender {tender_id} was not accepted by the API", file=sys.stderr)
         return False
 
+    ACCEPTED_TENDER_IDS.add(tender_id)
+
+    tick = STATE.case_tick or 0
+    bundle_id = f"tender-{tender_id}-exit"
     tender = TenderState(
         tender_id=tender_id,
         action=evaluation.action,
         price=evaluation.tender_price,
         quantity=evaluation.quantity,
         accepted=True,
+        route=evaluation.route,
+        direct_quantity=evaluation.direct_quantity,
+        basket_quantity=evaluation.basket_quantity,
     )
     STATE.tenders[tender_id] = tender
     STATE.strategy_status = "UNWINDING_TENDER"
 
-    tender_delta = evaluation.quantity if evaluation.action == "BUY" else -evaluation.quantity
-    exit_sign = 1 if evaluation.exit_action == "BUY" else -1
-    STATE.positions[RITC] += tender_delta
-    STATE.hedge_remaining[RITC] = exit_sign * evaluation.quantity
-    intent = STATE.add_intent(OrderIntent(
-        intent_id=f"tender-{tender_id}-unwind",
-        ticker=RITC,
-        quantity=exit_sign * evaluation.quantity,
-        reason="TENDER_UNWIND",
-        created_tick=STATE.case_tick or 0,
-        deadline_tick=(STATE.case_tick or 0) + 300,
-        limit_price=evaluation.exit_worst_price,
-        urgency=1.0,
-        priority=100,
-        context=f"tender={tender_id}",
-    ))
-    print(
-        f"INTENT ADD | id={intent.intent_id} reason={intent.reason} "
-        f"{intent.ticker} {intent.action} qty={abs(intent.quantity)} "
-        f"limit={intent.limit_price} deadline={intent.deadline_tick}"
+    tender_delta = (
+        evaluation.quantity if evaluation.action == "BUY" else -evaluation.quantity
     )
+    STATE.positions[RITC] += tender_delta
+    bundle = STATE.add_bundle(TradeBundle(
+        bundle_id=bundle_id,
+        reason=f"TENDER_{evaluation.route}",
+        created_tick=tick,
+        expected_profit_cad=evaluation.expected_profit_cad,
+        max_unhedged_ticks=2,
+        quantity=evaluation.quantity,
+        projected_gross=evaluation.projected_gross,
+        projected_net=evaluation.projected_net,
+        context=f"tender={tender_id} route={evaluation.route}",
+    ))
+    intent_ids = []
+    for leg in evaluation.exit_legs:
+        intent = STATE.add_intent(OrderIntent(
+            intent_id=f"{bundle_id}-{leg.ticker}",
+            ticker=leg.ticker,
+            quantity=leg.signed_quantity,
+            reason=f"TENDER_{leg.role}_EXIT",
+            created_tick=tick,
+            deadline_tick=tick + 300,
+            limit_price=leg.limit_price,
+            urgency=1.0,
+            priority=100,
+            bundle_id=bundle_id,
+            context=bundle.context,
+        ))
+        bundle.intent_ids.append(intent.intent_id)
+        intent_ids.append(intent.intent_id)
+        print(
+            f"INTENT ADD | id={intent.intent_id} reason={intent.reason} "
+            f"{intent.ticker} {intent.action} qty={abs(intent.quantity)} "
+            f"limit={intent.limit_price} deadline={intent.deadline_tick}"
+        )
+    tender.intent_ids = tuple(intent_ids)
     return True
 
 
 def sync_tender_unwinds():
-    """Reflect intention progress in the tender-specific dashboard fields."""
+    """Reflect direct and basket hedge progress in the dashboard."""
+    pending = {}
     for tender_id, tender in STATE.tenders.items():
-        intent = STATE.intents.get(f"tender-{tender_id}-unwind")
-        if intent is None:
+        legs = [STATE.intents[item] for item in tender.intent_ids]
+        if not legs:
             continue
-        tender.quantity_unwound = intent.filled_quantity
-        if intent.remaining:
-            STATE.hedge_remaining[RITC] = intent.remaining
-        else:
-            STATE.hedge_remaining.pop(RITC, None)
-            if STATE.strategy_status == "UNWINDING_TENDER":
-                STATE.strategy_status = "IDLE"
+        direct = next((leg for leg in legs if leg.ticker == RITC), None)
+        bull = next((leg for leg in legs if leg.ticker == BULL), None)
+        bear = next((leg for leg in legs if leg.ticker == BEAR), None)
+        direct_done = direct.filled_quantity if direct else 0
+        basket_done = min(
+            bull.filled_quantity if bull else 0,
+            bear.filled_quantity if bear else 0,
+        )
+        tender.quantity_unwound = direct_done + basket_done
+        for leg in legs:
+            if leg.remaining:
+                pending[leg.ticker] = pending.get(leg.ticker, 0) + leg.remaining
+    STATE.hedge_remaining = {
+        ticker: quantity for ticker, quantity in pending.items() if quantity
+    }
+    if not pending and STATE.strategy_status == "UNWINDING_TENDER":
+        STATE.strategy_status = "IDLE"
 
 
 def equity_gross(positions):

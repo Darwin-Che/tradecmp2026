@@ -145,6 +145,10 @@ class TenderState:
     quantity: int
     accepted: bool = False
     quantity_unwound: int = 0
+    route: str = "DIRECT"
+    direct_quantity: int = 0
+    basket_quantity: int = 0
+    intent_ids: Tuple[str, ...] = ()
 
     @property
     def remaining_to_unwind(self):
