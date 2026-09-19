@@ -4,12 +4,17 @@ from dataclasses import replace
 from math import ceil
 import os
 import sys
+from time import monotonic
 
 from api import ApiException
 from arbitrage import best_arbitrage, evaluate_arbitrage
 from convergence import find_convergence_exit, market_residual, update_convergence
 from fulfillment import fulfill_intents
 from intentions import OrderIntent, TradeBundle
+from manual_converter import (
+    BLOCK_SIZE, apply_conversion_to_open_lots, converted_blocks,
+    equity_signature, market_close_plan, propose_conversion, start_window,
+)
 from state import TenderState, TradingState
 from tender_strategy import evaluate_fixed_tender
 from valuation import liquidation_components_cad, liquidation_value_cad
@@ -17,14 +22,19 @@ from valuation import liquidation_components_cad, liquidation_value_cad
 STATE = TradingState(history_limit=300)
 ACCEPTED_TENDER_IDS = set()
 LOGGED_TENDER_REJECTIONS = set()
+CONVERTER_WINDOW = None
+CONVERTER_SUPPRESSED_POSITIONS = None
 
 
 def reset_for_new_heat():
     """Discard per-heat positions, orders, and tender IDs before trading again."""
     global STATE, RISK_LIMITS_LOADED, MAX_GROSS, MAX_LONG_NET, MAX_SHORT_NET
+    global CONVERTER_WINDOW, CONVERTER_SUPPRESSED_POSITIONS
     STATE = TradingState(history_limit=STATE.history_limit)
     ACCEPTED_TENDER_IDS.clear()
     LOGGED_TENDER_REJECTIONS.clear()
+    CONVERTER_WINDOW = None
+    CONVERTER_SUPPRESSED_POSITIONS = None
     RISK_LIMITS_LOADED = False
     MAX_GROSS = DEFAULT_MAX_GROSS
     MAX_LONG_NET = DEFAULT_MAX_LONG_NET
@@ -78,8 +88,16 @@ PNL_GROSS_PROFILES = (
     (0.25, 0.10),
 )
 PNL_MAX_GIVEBACK_FRACTION = 0.20
-PNL_RECOVERY_GIVEBACK_FRACTION = 0.15
+PNL_RECOVERY_GIVEBACK_FRACTION = 0.10
 PNL_DRAWDOWN_CONFIRM_TICKS = 2
+PNL_DRAWDOWN_RECOVERY_TICKS = int(
+    os.getenv("RIT_DRAWDOWN_RECOVERY_TICKS", "5")
+)
+PNL_DRAWDOWN_MIN_HOLD_TICKS = int(
+    os.getenv("RIT_DRAWDOWN_MIN_HOLD_TICKS", "20")
+)
+if PNL_DRAWDOWN_RECOVERY_TICKS < 1 or PNL_DRAWDOWN_MIN_HOLD_TICKS < 0:
+    raise ValueError("drawdown recovery ticks must be positive and hold ticks non-negative")
 TENDER_MAX_CARRY_GROSS_FRACTION = float(
     os.getenv("RIT_TENDER_MAX_CARRY_GROSS_FRACTION", "0.90")
 )
@@ -106,6 +124,30 @@ if LOSS_GROWTH_BLOCK_CAD < 0 or TENDER_MIN_BASKET_EDGE_CAD < 0:
 TENDER_BUFFER_USD = 0.03
 TENDER_MIN_PROFIT_CAD = 50.0
 TENDER_MAX_BOOK_AGE = 1.5
+MANUAL_CONVERTER_ENABLED = os.getenv(
+    "RIT_MANUAL_CONVERTER", "0"
+).lower() in ("1", "true", "yes")
+MANUAL_CONVERTER_WAIT_SECONDS = float(os.getenv(
+    "RIT_CONVERTER_WAIT_SECONDS", "5"
+))
+MANUAL_CONVERTER_MAX_BLOCKS = int(os.getenv(
+    "RIT_CONVERTER_MAX_BLOCKS", "1"
+))
+MANUAL_CONVERTER_DELAY_BUFFER_CAD = float(os.getenv(
+    "RIT_CONVERTER_DELAY_BUFFER_CAD_PER_SHARE", "0.03"
+))
+MANUAL_CONVERTER_MIN_ADVANTAGE_CAD = float(os.getenv(
+    "RIT_CONVERTER_MIN_ADVANTAGE_CAD", "100"
+))
+MANUAL_CONVERTER_MAX_FALLBACK_LOSS_CAD = float(os.getenv(
+    "RIT_CONVERTER_MAX_FALLBACK_LOSS_CAD_PER_BLOCK", "2500"
+))
+if (MANUAL_CONVERTER_WAIT_SECONDS <= 0
+        or MANUAL_CONVERTER_MAX_BLOCKS < 1
+        or MANUAL_CONVERTER_DELAY_BUFFER_CAD < 0
+        or MANUAL_CONVERTER_MIN_ADVANTAGE_CAD < 0
+        or MANUAL_CONVERTER_MAX_FALLBACK_LOSS_CAD < 0):
+    raise ValueError("manual converter settings must be positive or non-negative")
 
 
 def load_risk_limits(client):
@@ -135,6 +177,12 @@ def load_risk_limits(client):
         f"RISK LIMITS | gross={MAX_GROSS} "
         f"net=[{MAX_SHORT_NET},{MAX_LONG_NET}]"
     )
+    if MANUAL_CONVERTER_ENABLED:
+        print(
+            "MANUAL CONVERTER | armed for human use only "
+            f"wait={MANUAL_CONVERTER_WAIT_SECONDS:.1f}s "
+            f"max_blocks={MANUAL_CONVERTER_MAX_BLOCKS}"
+        )
 
 def get_tick_status(client):
     # Gets simulation status (active or stopped) for the tick
@@ -167,7 +215,7 @@ def positions_map(client):
     """Return current simulator positions, including currency cash balances."""
     data = client.get_securities()
     if data is None:
-        return {k: 0 for k in (BULL, BEAR, RITC, USD, CAD)}
+        return None
     out = {p["ticker"]: int(p.get("position", 0)) for p in data}
     for k in (BULL, BEAR, RITC, USD, CAD):
         out.setdefault(k, 0)
@@ -190,6 +238,10 @@ def accept_active_tender_offers(client):
     )
     if STATE.loss_growth_guard_active:
         carry_cap = equity_gross(STATE.positions)
+    if STATE.pnl_drawdown_active:
+        current_gross = equity_gross(STATE.positions)
+        drawdown_cap = int(MAX_GROSS * STATE.gross_target_fraction)
+        carry_cap = min(carry_cap, max(current_gross, drawdown_cap))
     for offer in offers:
         tender_id = offer["tender_id"]
         if tender_id in ACCEPTED_TENDER_IDS:
@@ -380,6 +432,13 @@ def arb_plan_allowed(plan, gross, *, reducing=False):
         return False
     if STATE.loss_growth_guard_active and plan.projected_gross > gross:
         return False
+    if STATE.pnl_drawdown_active:
+        cap = int(MAX_GROSS * STATE.gross_target_fraction)
+        if gross > cap:
+            if plan.projected_gross >= gross:
+                return False
+        elif plan.projected_gross > cap:
+            return False
     inventory_guard = reducing or gross >= MAX_GROSS * pnl_risk_profile()[0]
     return not (inventory_guard and plan.projected_gross >= gross)
 
@@ -439,6 +498,120 @@ def inventory_reduction_plan():
         return None
     STATE.strategy_status = "REDUCING_INVENTORY"
     return replace(plan, reason=f"INVENTORY_REDUCE_{direction}")
+
+
+def start_manual_converter_if_better():
+    """Offer a manual conversion only when it beats bounded market fallback."""
+    global CONVERTER_WINDOW
+    if (not MANUAL_CONVERTER_ENABLED or CONVERTER_WINDOW is not None
+            or STATE.case_tick is None
+            or STATE.case_tick >= ENDGAME_HOLD_TICK
+            or equity_signature(STATE.positions) == CONVERTER_SUPPRESSED_POSITIONS):
+        return False
+    gross = equity_gross(STATE.positions)
+    start_fraction, target_fraction, _ = pnl_risk_profile()
+    if (gross <= MAX_GROSS * target_fraction
+            or (gross < MAX_GROSS * start_fraction
+                and STATE.strategy_status != "REDUCING_INVENTORY")):
+        return False
+    if (STATE.active_intents()
+            or any(bundle.status in ("PLANNED", "HEDGING", "INCOMPLETE")
+                   for bundle in STATE.bundles.values())):
+        return False
+    proposal = propose_conversion(
+        STATE, max_blocks=MANUAL_CONVERTER_MAX_BLOCKS,
+        market_fee=FEE_MKT,
+        delay_buffer_cad_per_share=MANUAL_CONVERTER_DELAY_BUFFER_CAD,
+        min_advantage_cad=MANUAL_CONVERTER_MIN_ADVANTAGE_CAD,
+        max_fallback_loss_cad_per_block=MANUAL_CONVERTER_MAX_FALLBACK_LOSS_CAD,
+        max_book_age_seconds=TENDER_MAX_BOOK_AGE,
+    )
+    if proposal is None:
+        return False
+    CONVERTER_WINDOW = start_window(
+        proposal, STATE.positions, MANUAL_CONVERTER_WAIT_SECONDS,
+    )
+    STATE.strategy_status = "WAITING_MANUAL_CONVERTER"
+    STATE.manual_converter_instruction = (
+        f"MANUAL {proposal.action} {proposal.blocks} x {BLOCK_SIZE:,} "
+        f"in Assets; {MANUAL_CONVERTER_WAIT_SECONDS:.1f}s deadline"
+    )
+    print(
+        f"CONVERTER ACTION | {STATE.manual_converter_instruction} | "
+        f"market_close={proposal.market_close_cad:+.2f}CAD "
+        f"converter_cost={proposal.converter_cost_cad:.2f}CAD "
+        f"advantage={proposal.advantage_cad:+.2f}CAD | "
+        "new orders paused until confirmation or fallback"
+    )
+    return True
+
+
+def progress_manual_converter(now=None):
+    """Confirm observed conversion, or return a market fallback after timeout."""
+    global CONVERTER_WINDOW, CONVERTER_SUPPRESSED_POSITIONS
+    window = CONVERTER_WINDOW
+    if window is None:
+        return False, None
+    observed = converted_blocks(window, STATE.positions)
+    if observed is None or observed < window.confirmed_blocks:
+        print(
+            "CONVERTER ABORT | unexpected position change; "
+            "no fallback order submitted automatically"
+        )
+        CONVERTER_SUPPRESSED_POSITIONS = equity_signature(STATE.positions)
+        CONVERTER_WINDOW = None
+        STATE.manual_converter_instruction = ""
+        STATE.strategy_status = "IDLE"
+        return True, None
+    if observed > window.confirmed_blocks:
+        quantity = (observed - window.confirmed_blocks) * BLOCK_SIZE
+        matched = apply_conversion_to_open_lots(
+            STATE, window.proposal.action, quantity,
+        )
+        window.confirmed_blocks = observed
+        print(
+            f"CONVERTER CONFIRMED | action={window.proposal.action} "
+            f"blocks={observed}/{window.proposal.blocks} "
+            f"matched_arb_lots={matched}/{quantity} "
+            f"positions={equity_signature(STATE.positions)}"
+        )
+    if observed == window.proposal.blocks:
+        CONVERTER_WINDOW = None
+        STATE.manual_converter_instruction = ""
+        STATE.strategy_status = "IDLE"
+        return True, None
+    current = monotonic() if now is None else now
+    if current < window.deadline_at:
+        remaining = window.proposal.blocks - observed
+        STATE.manual_converter_instruction = (
+            f"MANUAL {window.proposal.action} {remaining} x {BLOCK_SIZE:,} "
+            f"in Assets; {window.deadline_at - current:.1f}s left"
+        )
+        return True, None
+
+    remaining = window.proposal.blocks - observed
+    quantity = remaining * BLOCK_SIZE
+    plan = market_close_plan(
+        STATE, window.proposal.direction, quantity, FEE_MKT,
+    )
+    CONVERTER_SUPPRESSED_POSITIONS = equity_signature(STATE.positions)
+    CONVERTER_WINDOW = None
+    STATE.manual_converter_instruction = ""
+    STATE.strategy_status = "IDLE"
+    if (plan is None or plan.expected_profit_cad
+            < -MANUAL_CONVERTER_MAX_FALLBACK_LOSS_CAD * remaining):
+        print(
+            f"CONVERTER FALLBACK UNAVAILABLE | remaining={quantity} "
+            "market depth or loss bound failed; normal strategy resumes"
+        )
+        return True, None
+    print(
+        f"CONVERTER FALLBACK | remaining={quantity} "
+        f"market_close={plan.expected_profit_cad:+.2f}CAD"
+    )
+    return True, replace(
+        plan, reason=f"CONVERTER_FALLBACK_{window.proposal.direction}",
+    )
 
 
 def enqueue_arb(plan, closes_bundle_id=None):
@@ -531,6 +704,12 @@ def step_once(client):
     usd_bid, usd_ask = usd_book.best_bid, usd_book.best_ask
 
     pos = positions_map(client)
+    if pos is None:
+        print("POSITIONS UNAVAILABLE | skipping decisions and manual confirmation")
+        return False, None, None, {}
+    positions_reconciled = (
+        equity_signature(pos) == equity_signature(STATE.positions)
+    )
     STATE.update_positions(pos)
     previous_profile = (
         STATE.gross_start_fraction,
@@ -550,6 +729,8 @@ def step_once(client):
         giveback_fraction=PNL_MAX_GIVEBACK_FRACTION,
         recovery_fraction=PNL_RECOVERY_GIVEBACK_FRACTION,
         confirmation_ticks=PNL_DRAWDOWN_CONFIRM_TICKS,
+        recovery_confirmation_ticks=PNL_DRAWDOWN_RECOVERY_TICKS,
+        minimum_drawdown_ticks=PNL_DRAWDOWN_MIN_HOLD_TICKS,
         minimum_high_water=PNL_THRESHOLDS_CAD[0],
     )
     loss_guard = loss_growth_guard_active()
@@ -580,6 +761,7 @@ def step_once(client):
             f"gross_band={int(MAX_GROSS * risk_start)}->{int(MAX_GROSS * risk_target)} "
             f"drawdown={drawdown} mark=[{mark_text}]"
         )
+    manual_blocked, converter_fallback = progress_manual_converter()
     unfinished_bundle = any(
         bundle.status in ("HEDGING", "INCOMPLETE")
         for bundle in STATE.bundles.values()
@@ -597,7 +779,7 @@ def step_once(client):
             passive_wait_ticks=PASSIVE_WAIT_TICKS,
         )
         sync_tender_unwinds()
-        return busy or submitted, None, None, {
+        return busy or manual_blocked or submitted, None, None, {
             "bull_bid": bull_bid, "bull_ask": bull_ask,
             "bear_bid": bear_bid, "bear_ask": bear_ask,
             "ritc_bid_usd": ritc_bid_usd, "ritc_ask_usd": ritc_ask_usd,
@@ -627,10 +809,16 @@ def step_once(client):
     update_convergence(STATE, market_fee=FEE_MKT)
 
     created = False
-    if not busy:
+    if converter_fallback is not None:
+        enqueue_arb(converter_fallback)
+        created = True
+    if not busy and not manual_blocked and not created:
         created = accept_active_tender_offers(client)
 
-    if not busy and not created:
+    if not busy and not created and not manual_blocked and positions_reconciled:
+        manual_blocked = start_manual_converter_if_better()
+
+    if not busy and not created and not manual_blocked:
         gross = equity_gross(STATE.positions)
         closes_bundle_id = None
         exit_choice = find_convergence_exit(
@@ -686,7 +874,7 @@ def step_once(client):
     )
     sync_tender_unwinds()
 
-    return busy or created or submitted, buy_etf_edge, sell_etf_edge, {
+    return busy or manual_blocked or created or submitted, buy_etf_edge, sell_etf_edge, {
         "bull_bid": bull_bid, "bull_ask": bull_ask,
         "bear_bid": bear_bid, "bear_ask": bear_ask,
         "ritc_bid_usd": ritc_bid_usd, "ritc_ask_usd": ritc_ask_usd,

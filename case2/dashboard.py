@@ -167,7 +167,7 @@ class TerminalDashboard:
                 f"latest {percent} | round trip {round_trip}"
             )
 
-        return [
+        lines = [
             border,
             row(
                 f"RITC ETF ARBITRAGE | tick {self.state.case_tick} | "
@@ -188,5 +188,8 @@ class TerminalDashboard:
             row(market_two),
             row(execution),
             row(convergence),
-            border,
         ]
+        if self.state.manual_converter_instruction:
+            lines.append(row(self.state.manual_converter_instruction))
+        lines.append(border)
+        return lines
