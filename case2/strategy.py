@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 from math import ceil
+import os
 import sys
 
 from api import ApiException
@@ -17,6 +18,17 @@ STATE = TradingState(history_limit=300)
 ACCEPTED_TENDER_IDS = set()
 
 
+def reset_for_new_heat():
+    """Discard per-heat positions, orders, and tender IDs before trading again."""
+    global STATE, RISK_LIMITS_LOADED, MAX_GROSS, MAX_LONG_NET, MAX_SHORT_NET
+    STATE = TradingState(history_limit=STATE.history_limit)
+    ACCEPTED_TENDER_IDS.clear()
+    RISK_LIMITS_LOADED = False
+    MAX_GROSS = DEFAULT_MAX_GROSS
+    MAX_LONG_NET = DEFAULT_MAX_LONG_NET
+    MAX_SHORT_NET = DEFAULT_MAX_SHORT_NET
+
+
 # Tickers
 CAD  = "CAD"    # currency instrument quoted in CAD
 USD  = "USD"    # price of 1 USD in CAD (i.e., USD/CAD)
@@ -29,11 +41,27 @@ FEE_MKT = 0.02          # $/share for market orders
 MAX_SIZE_EQUITY = 10000 # per order for BULL/BEAR/RITC
 
 # Basic risk guardrails (adjust as needed)
-MAX_LONG_NET  = 25000
-MAX_SHORT_NET = -25000
-MAX_GROSS     = 300000
+DEFAULT_MAX_LONG_NET = 25000
+DEFAULT_MAX_SHORT_NET = -25000
+DEFAULT_MAX_GROSS = 300000
+MAX_LONG_NET  = DEFAULT_MAX_LONG_NET
+MAX_SHORT_NET = DEFAULT_MAX_SHORT_NET
+MAX_GROSS     = DEFAULT_MAX_GROSS
 ORDER_QTY     = 5000    # child order size for arb legs
 RISK_LIMITS_LOADED = False
+
+# Tick-based intent settings. The intent deadline controls how long an
+# unstarted arbitrage bundle waits; max_unhedged_ticks is recorded separately.
+ARB_INTENT_DEADLINE_TICKS = int(os.getenv("RIT_ARB_INTENT_DEADLINE_TICKS", "2"))
+MAX_UNHEDGED_TICKS = int(os.getenv("RIT_MAX_UNHEDGED_TICKS", "2"))
+if ARB_INTENT_DEADLINE_TICKS < 0 or MAX_UNHEDGED_TICKS < 0:
+    raise ValueError("intent deadline and max unhedged ticks must be non-negative")
+EXECUTION_POLICY = os.getenv("RIT_EXECUTION_POLICY", "market").lower()
+if EXECUTION_POLICY not in ("market", "adaptive_limit"):
+    raise ValueError("RIT_EXECUTION_POLICY must be market or adaptive_limit")
+PASSIVE_WAIT_TICKS = int(os.getenv("RIT_PASSIVE_WAIT_TICKS", "1"))
+if PASSIVE_WAIT_TICKS < 0:
+    raise ValueError("RIT_PASSIVE_WAIT_TICKS must be non-negative")
 
 ARB_MIN_NET_EDGE_CAD = 0.05
 ARB_MIN_PROFIT_CAD = 150.0
@@ -187,7 +215,7 @@ def accept_active_tender_offers(client):
         reason=f"TENDER_{evaluation.route}",
         created_tick=tick,
         expected_profit_cad=evaluation.expected_profit_cad,
-        max_unhedged_ticks=2,
+        max_unhedged_ticks=MAX_UNHEDGED_TICKS,
         quantity=evaluation.quantity,
         projected_gross=evaluation.projected_gross,
         projected_net=evaluation.projected_net,
@@ -332,7 +360,7 @@ def enqueue_arb(plan, closes_bundle_id=None):
         reason=plan.reason,
         created_tick=tick,
         expected_profit_cad=plan.expected_profit_cad,
-        max_unhedged_ticks=2,
+        max_unhedged_ticks=MAX_UNHEDGED_TICKS,
         quantity=plan.quantity,
         open_quantity=plan.quantity if is_opening else 0,
         closes_reason=closes_reason,
@@ -358,7 +386,7 @@ def enqueue_arb(plan, closes_bundle_id=None):
             quantity=leg.signed_quantity,
             reason=plan.reason,
             created_tick=tick,
-            deadline_tick=tick + bundle.max_unhedged_ticks,
+            deadline_tick=tick + ARB_INTENT_DEADLINE_TICKS,
             limit_price=leg.limit_price,
             urgency=1.0,
             priority=50,
@@ -421,6 +449,8 @@ def step_once(client):
         submitted = fulfill_intents(
             client, STATE, max_order_size=MAX_SIZE_EQUITY,
             fee_per_share=FEE_MKT,
+            policy=EXECUTION_POLICY,
+            passive_wait_ticks=PASSIVE_WAIT_TICKS,
         )
         sync_tender_unwinds()
         return busy or submitted, None, None, {
@@ -503,6 +533,8 @@ def step_once(client):
     submitted = fulfill_intents(
         client, STATE, max_order_size=MAX_SIZE_EQUITY,
         fee_per_share=FEE_MKT,
+        policy=EXECUTION_POLICY,
+        passive_wait_ticks=PASSIVE_WAIT_TICKS,
     )
     sync_tender_unwinds()
 

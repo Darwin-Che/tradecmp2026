@@ -2,7 +2,7 @@
 
 import unittest
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 # The pure strategy tests do not instantiate the HTTP client. Keep them runnable
 # in minimal Python environments where the live client's requests dependency is absent.
@@ -165,6 +165,37 @@ class TenderRouteTests(unittest.TestCase):
                 strategy.MAX_SHORT_NET,
                 strategy.MAX_LONG_NET,
             ) = original_limits
+
+    def test_arbitrage_deadline_and_unhedged_setting_are_independent(self):
+        original_state = strategy.STATE
+        original_deadline = strategy.ARB_INTENT_DEADLINE_TICKS
+        original_unhedged = strategy.MAX_UNHEDGED_TICKS
+        try:
+            strategy.STATE = market_state()
+            strategy.STATE.update_case(40, "ACTIVE")
+            strategy.ARB_INTENT_DEADLINE_TICKS = 4
+            strategy.MAX_UNHEDGED_TICKS = 7
+            plan = SimpleNamespace(
+                reason="ETF_ARB_BUY_ETF",
+                quantity=100,
+                expected_profit_cad=50.0,
+                gross_profit_cad=56.0,
+                fees_cad=6.0,
+                edge_per_share_cad=0.5,
+                projected_gross=400,
+                projected_net=0,
+                legs=(SimpleNamespace(
+                    ticker="RITC", signed_quantity=100, limit_price=25.49,
+                ),),
+            )
+            bundle = strategy.enqueue_arb(plan)
+            self.assertEqual(bundle.max_unhedged_ticks, 7)
+            intent = strategy.STATE.intents[bundle.intent_ids[0]]
+            self.assertEqual(intent.deadline_tick, 44)
+        finally:
+            strategy.STATE = original_state
+            strategy.ARB_INTENT_DEADLINE_TICKS = original_deadline
+            strategy.MAX_UNHEDGED_TICKS = original_unhedged
 
 
 if __name__ == "__main__":

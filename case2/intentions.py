@@ -30,6 +30,9 @@ class OrderIntent:
     remaining: Optional[int] = None
     status: str = "ACTIVE"
     order_ids: List[int] = field(default_factory=list)
+    live_order_id: Optional[int] = None
+    live_order_tick: Optional[int] = None
+    live_order_mode: Optional[str] = None
 
     def __post_init__(self):
         self.quantity = int(self.quantity)

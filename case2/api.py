@@ -84,6 +84,12 @@ class RITClient:
     def get_limits(self):
         return self.request("GET", "limits")
 
+    def get_order(self, order_id):
+        return self.request("GET", f"orders/{int(order_id)}")
+
+    def cancel_order(self, order_id):
+        return self.request("DELETE", f"orders/{int(order_id)}")
+
     def accept_tender(self, tender_id, price=None):
         if price is None:
             raise ValueError("A tender acceptance price is required by RIT API v1.0.4+")

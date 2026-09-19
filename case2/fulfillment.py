@@ -52,6 +52,9 @@ def _prepare_bundles(state, current_tick):
             bundle.status = "HEDGING"
             continue
         if any(item.is_expired(current_tick) for item in members):
+            if any(item.live_order_id is not None for item in members):
+                bundle.status = "PLANNED"
+                continue
             for intent in members:
                 if intent.is_active:
                     intent.status = "CANCELLED"
@@ -97,7 +100,7 @@ def _apply_inventory_closes(state):
         )
 
 
-def fulfill_intents(client, state, max_order_size=10_000, fee_per_share=0.02):
+def fulfill_market_intents(client, state, max_order_size=10_000, fee_per_share=0.02):
     """Execute intentions while preserving bundle hedge obligations."""
     current_tick = state.case_tick if state.case_tick is not None else 0
     ready_bundles = _prepare_bundles(state, current_tick)
@@ -176,3 +179,28 @@ def fulfill_intents(client, state, max_order_size=10_000, fee_per_share=0.02):
             bundle.status = "INCOMPLETE"
     _apply_inventory_closes(state)
     return submitted
+
+
+def fulfill_intents(
+    client,
+    state,
+    max_order_size=10_000,
+    fee_per_share=0.02,
+    policy="market",
+    passive_wait_ticks=1,
+):
+    """Select the original market executor or the reconciled limit executor."""
+    if policy == "market":
+        return fulfill_market_intents(
+            client, state, max_order_size=max_order_size,
+            fee_per_share=fee_per_share,
+        )
+    if policy == "adaptive_limit":
+        from limit_fulfillment import fulfill_limit_intents
+
+        return fulfill_limit_intents(
+            client, state,
+            max_order_size=max_order_size,
+            passive_wait_ticks=passive_wait_ticks,
+        )
+    raise ValueError(f"unsupported execution policy: {policy}")

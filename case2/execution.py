@@ -65,3 +65,45 @@ def submit_market_order(
         f"commission={commission:.2f}{currency}"
     )
     return response
+
+
+def submit_limit_order(
+    client,
+    state,
+    ticker,
+    action,
+    quantity,
+    price,
+    reason,
+    context="",
+):
+    """Submit a limit order; fills remain subject to later reconciliation."""
+    quantity = int(quantity)
+    print(
+        f"ORDER SUBMIT | reason={reason} {context} | "
+        f"{ticker} {action} qty={quantity} type=LIMIT price={price:.4f}"
+    )
+    response = client.place_order(
+        ticker, action, quantity, order_type="LIMIT", price=price,
+    )
+    if not response:
+        print(
+            f"ORDER RESULT | reason={reason} {context} | no API response",
+            file=sys.stderr,
+        )
+        return response
+    order_id = response.get("order_id")
+    if order_id is not None:
+        state.orders[int(order_id)] = OrderState(
+            order_id=int(order_id),
+            ticker=ticker,
+            action=action,
+            quantity=quantity,
+            order_type="LIMIT",
+            price=price,
+            filled=int(response.get("quantity_filled", 0)),
+            status=response.get("status", "UNKNOWN"),
+            reason=reason,
+            context=context,
+        )
+    return response
