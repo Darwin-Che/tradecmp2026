@@ -15,6 +15,7 @@ except ImportError:
 
 import strategy
 from fulfillment import fulfill_intents
+from intentions import OrderIntent, TradeBundle
 from state import TradingState
 from tender_strategy import evaluate_fixed_tender
 
@@ -70,6 +71,56 @@ class FakeClient:
 
 
 class TenderRouteTests(unittest.TestCase):
+    def test_tender_offsets_existing_arbitrage_lot(self):
+        original_state = strategy.STATE
+        original_ids = strategy.ACCEPTED_TENDER_IDS
+        original_limits = (
+            strategy.MAX_GROSS, strategy.MAX_SHORT_NET, strategy.MAX_LONG_NET,
+        )
+        try:
+            strategy.STATE = market_state({
+                "BULL": -5_000, "BEAR": -5_000, "RITC": 5_000,
+            })
+            strategy.STATE.update_case(100, "ACTIVE")
+            strategy.STATE.record_book(
+                "RITC", ((25.47, 200_000),), ((25.49, 16_000),)
+            )
+            opening = strategy.STATE.add_bundle(TradeBundle(
+                bundle_id="opening", reason="ETF_ARB_BUY_ETF",
+                created_tick=20, expected_profit_cad=200,
+                max_unhedged_ticks=2, quantity=5_000,
+                open_quantity=5_000, status="FILLED",
+            ))
+            for ticker, quantity in (("BULL", -5_000), ("BEAR", -5_000),
+                                     ("RITC", 5_000)):
+                intent = strategy.STATE.add_intent(OrderIntent(
+                    intent_id=f"opening-{ticker}", ticker=ticker,
+                    quantity=quantity, reason="ETF_ARB_BUY_ETF",
+                    created_tick=20, deadline_tick=22,
+                    remaining=0, status="FILLED", bundle_id="opening",
+                ))
+                opening.intent_ids.append(intent.intent_id)
+            strategy.ACCEPTED_TENDER_IDS = set()
+            strategy.MAX_GROSS = 300_000
+            strategy.MAX_SHORT_NET = -200_000
+            strategy.MAX_LONG_NET = 200_000
+            client = FakeClient([offer(
+                action="SELL", quantity=50_000, price=26.20, tender_id=73,
+            )])
+            with redirect_stdout(io.StringIO()):
+                self.assertTrue(strategy.accept_active_tender_offers(client))
+                for _ in range(6):
+                    fulfill_intents(client, strategy.STATE)
+            tender_bundle = strategy.STATE.bundles["tender-73-exit"]
+            self.assertEqual(tender_bundle.offset_quantity, 5_000)
+            self.assertEqual(tender_bundle.status, "FILLED")
+            self.assertEqual(opening.open_quantity, 0)
+        finally:
+            strategy.STATE = original_state
+            strategy.ACCEPTED_TENDER_IDS = original_ids
+            (strategy.MAX_GROSS, strategy.MAX_SHORT_NET,
+             strategy.MAX_LONG_NET) = original_limits
+
     def test_identical_rejections_are_logged_once_by_default(self):
         original_state = strategy.STATE
         original_rejections = strategy.LOGGED_TENDER_REJECTIONS
@@ -109,13 +160,112 @@ class TenderRouteTests(unittest.TestCase):
         )
 
     def test_hybrid_respects_gross_capacity(self):
-        evaluation = self.evaluate(offer(quantity=98_000))
+        evaluation = self.evaluate(offer(quantity=98_000, price=25.50))
         self.assertTrue(evaluation.should_accept)
         self.assertEqual(evaluation.route, "HYBRID")
         self.assertEqual(
             evaluation.direct_quantity + evaluation.basket_quantity, 98_000
         )
         self.assertLessEqual(evaluation.projected_gross, 300_000)
+
+    def test_basket_route_reserves_future_close_fees(self):
+        state = market_state()
+        evaluation = self.evaluate(offer(), state)
+        self.assertGreater(evaluation.basket_quantity, 0)
+        self.assertGreater(evaluation.close_fee_reserve_cad, 0)
+        usd = state.current_books["USD"]
+        conversion = (usd.best_bid if evaluation.expected_profit_usd >= 0
+                      else usd.best_ask)
+        self.assertAlmostEqual(
+            evaluation.expected_profit_cad,
+            evaluation.expected_profit_usd * conversion
+            + evaluation.basket_profit_cad - evaluation.close_fee_reserve_cad,
+        )
+
+    def test_small_positive_basket_edge_is_not_enough(self):
+        evaluation = self.evaluate(
+            offer(price=25.72),
+            minimum_basket_edge_cad_per_share=0.03,
+        )
+        self.assertGreater(evaluation.expected_profit_cad, 50)
+        self.assertFalse(evaluation.should_accept)
+        self.assertEqual(evaluation.reason, "basket edge below minimum")
+
+    def test_basket_edge_floor_does_not_block_profitable_direct_route(self):
+        state = market_state()
+        state.record_book(
+            "BEAR", ((15.58, 200_000),), ((15.60, 200_000),)
+        )
+        evaluation = self.evaluate(
+            offer(price=25.40), state,
+            minimum_basket_edge_cad_per_share=0.03,
+        )
+        self.assertTrue(evaluation.should_accept)
+        self.assertEqual(evaluation.route, "DIRECT")
+
+    def test_loss_guard_allows_direct_tender_without_gross_growth(self):
+        original_state = strategy.STATE
+        original_ids = strategy.ACCEPTED_TENDER_IDS
+        original_limits = (
+            strategy.MAX_GROSS, strategy.MAX_SHORT_NET, strategy.MAX_LONG_NET,
+        )
+        try:
+            strategy.STATE = market_state()
+            strategy.STATE.update_case(100, "ACTIVE")
+            strategy.STATE.loss_growth_guard_active = True
+            strategy.ACCEPTED_TENDER_IDS = set()
+            strategy.MAX_GROSS = 300_000
+            strategy.MAX_SHORT_NET = -200_000
+            strategy.MAX_LONG_NET = 200_000
+            client = FakeClient([offer(price=25.40, tender_id=72)])
+            with redirect_stdout(io.StringIO()):
+                self.assertTrue(strategy.accept_active_tender_offers(client))
+            self.assertEqual(strategy.STATE.tenders[72].route, "DIRECT")
+            self.assertEqual(strategy.STATE.bundles[
+                "tender-72-exit"].projected_gross, 0)
+        finally:
+            strategy.STATE = original_state
+            strategy.ACCEPTED_TENDER_IDS = original_ids
+            (strategy.MAX_GROSS, strategy.MAX_SHORT_NET,
+             strategy.MAX_LONG_NET) = original_limits
+
+    def test_residual_gross_cap_changes_route_or_rejects(self):
+        state = market_state()
+        state.record_book(
+            "RITC", ((25.47, 5_000),), ((25.49, 200_000),)
+        )
+        evaluation = self.evaluate(
+            offer(), state, max_residual_gross=60_000,
+        )
+        self.assertFalse(evaluation.should_accept)
+        self.assertEqual(evaluation.reason, "residual gross carry cap")
+
+    def test_late_tender_with_large_residual_is_rejected(self):
+        original_state = strategy.STATE
+        original_limits = (
+            strategy.MAX_GROSS, strategy.MAX_SHORT_NET, strategy.MAX_LONG_NET,
+        )
+        try:
+            strategy.STATE = market_state({
+                "BULL": -7_500, "BEAR": -7_500, "RITC": 7_500,
+            })
+            strategy.STATE.update_case(strategy.TENDER_LATE_TICK + 25, "ACTIVE")
+            strategy.STATE.record_book(
+                "RITC", ((25.47, 200_000),), ((25.49, 16_000),)
+            )
+            strategy.MAX_GROSS = 300_000
+            strategy.MAX_SHORT_NET = -200_000
+            strategy.MAX_LONG_NET = 200_000
+            client = FakeClient([offer(
+                action="SELL", quantity=81_000, price=26.20, tender_id=77,
+            )])
+            with redirect_stdout(io.StringIO()):
+                self.assertFalse(strategy.accept_active_tender_offers(client))
+            self.assertEqual(client.accepted, [])
+        finally:
+            strategy.STATE = original_state
+            (strategy.MAX_GROSS, strategy.MAX_SHORT_NET,
+             strategy.MAX_LONG_NET) = original_limits
 
     def test_acceptance_limit_is_checked_before_planned_hedge(self):
         state = market_state({"BULL": 98_000, "BEAR": 98_000})

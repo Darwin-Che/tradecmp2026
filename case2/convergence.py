@@ -82,6 +82,7 @@ def find_convergence_exit(
     max_gross=300_000,
     min_net=-25_000,
     max_net=25_000,
+    minimum_close_profit_cad=float("-inf"),
 ):
     """Return an executable close plan and its exact opening lot."""
     for opening in state.bundles.values():
@@ -109,6 +110,8 @@ def find_convergence_exit(
             prefer_larger=True,
         )
         if plan is None:
+            continue
+        if plan.expected_profit_cad < minimum_close_profit_cad:
             continue
         entry_profit = (
             opening.expected_profit_cad

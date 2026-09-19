@@ -57,6 +57,7 @@ def log_completed_bundles(state):
             f"{prefix} | id={bundle.bundle_id}{tender_detail} "
             f"reason={bundle.reason} tick={state.case_tick} "
             f"planned_net={bundle.expected_profit_cad:+.2f}CAD "
+            f"offset={bundle.offset_quantity} opening={bundle.open_quantity} "
             f"legs={','.join(legs)} fee_est={fee_text} "
             f"unfilled_legs={unfilled} "
             f"portfolio=BULL:{bull:+d},BEAR:{bear:+d},RITC:{ritc:+d} "

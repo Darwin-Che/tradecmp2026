@@ -2,6 +2,7 @@
 
 from collections import deque
 from dataclasses import dataclass, field
+from statistics import median
 from time import time
 from typing import Deque, Dict, Iterable, Optional, Tuple
 
@@ -183,6 +184,15 @@ class TradingState:
     gross_start_fraction: float = 0.80
     gross_target_fraction: float = 0.65
     pnl_drawdown_active: bool = False
+    risk_pnl_cad: Optional[float] = None
+    risk_high_water_cad: float = 0.0
+    risk_mark_history: Deque[float] = field(
+        default_factory=lambda: deque(maxlen=3)
+    )
+    risk_mark_tick: Optional[int] = None
+    risk_breach_ticks: int = 0
+    risk_recovery_ticks: int = 0
+    loss_growth_guard_active: bool = False
 
     def __post_init__(self):
         if self.history_limit <= 0:
@@ -235,6 +245,44 @@ class TradingState:
             self.portfolio_baseline_cad = self.portfolio_value_cad
         self.update_pnl(self.portfolio_value_cad - self.portfolio_baseline_cad)
 
+    def update_risk_mark(self, tick, *, eligible, giveback_fraction=0.20,
+                         recovery_fraction=0.15, confirmation_ticks=2,
+                         minimum_high_water=10_000.0):
+        """Use one stable mark per tick; ignore marks during live hedging."""
+        if not eligible or tick is None or tick == self.risk_mark_tick:
+            return
+        self.risk_mark_tick = tick
+        self.risk_mark_history.append(self.pnl_cad)
+        self.risk_pnl_cad = float(median(self.risk_mark_history))
+        self.risk_high_water_cad = max(
+            self.risk_high_water_cad, self.risk_pnl_cad
+        )
+        if self.pnl_drawdown_active:
+            recovering = (
+                self.risk_pnl_cad
+                >= self.risk_high_water_cad * (1 - recovery_fraction)
+            )
+            self.risk_recovery_ticks = (
+                self.risk_recovery_ticks + 1 if recovering else 0
+            )
+            self.risk_breach_ticks = 0
+            if self.risk_recovery_ticks >= confirmation_ticks:
+                self.pnl_drawdown_active = False
+                self.risk_recovery_ticks = 0
+        else:
+            breaching = (
+                self.risk_high_water_cad >= minimum_high_water
+                and self.risk_pnl_cad
+                <= self.risk_high_water_cad * (1 - giveback_fraction)
+            )
+            self.risk_breach_ticks = (
+                self.risk_breach_ticks + 1 if breaching else 0
+            )
+            self.risk_recovery_ticks = 0
+            if self.risk_breach_ticks >= confirmation_ticks:
+                self.pnl_drawdown_active = True
+                self.risk_breach_ticks = 0
+
     def update_risk_profile(self, start, target, drawdown_active=False):
         self.gross_start_fraction = float(start)
         self.gross_target_fraction = float(target)
@@ -282,9 +330,11 @@ class TradingState:
             f"tick={self.case_tick} case={self.case_status} "
             f"strategy={self.strategy_status} | {positions} | "
             f"pnl={self.pnl_cad:+.2f}CAD "
-            f"high={self.pnl_high_water_cad:+.2f}CAD "
+            f"risk_pnl={self.risk_pnl_cad if self.risk_pnl_cad is not None else 0:+.2f}CAD "
+            f"risk_high={self.risk_high_water_cad:+.2f}CAD "
             f"risk={self.gross_start_fraction:.0%}->{self.gross_target_fraction:.0%} "
-            f"drawdown={self.pnl_drawdown_active} | {edge_text}"
+            f"drawdown={self.pnl_drawdown_active} "
+            f"loss_guard={self.loss_growth_guard_active} | {edge_text}"
         )
         if detail == 0:
             return header

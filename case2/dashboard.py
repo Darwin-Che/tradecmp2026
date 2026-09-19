@@ -176,10 +176,12 @@ class TerminalDashboard:
             row(f"Positions: {positions}"),
             row(
                 f"Marked P&L CAD: {self.state.pnl_cad:+.2f} | "
-                f"high water {self.state.pnl_high_water_cad:+.2f} | "
+                f"risk P&L {self.state.risk_pnl_cad if self.state.risk_pnl_cad is not None else 0:+.2f} | "
+                f"risk high {self.state.risk_high_water_cad:+.2f} | "
                 f"gross {self.state.gross_start_fraction:.0%}->"
                 f"{self.state.gross_target_fraction:.0%} | "
-                f"drawdown {self.state.pnl_drawdown_active}"
+                f"drawdown {self.state.pnl_drawdown_active} | "
+                f"loss guard {self.state.loss_growth_guard_active}"
             ),
             row(edge_text),
             row(market_one),

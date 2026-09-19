@@ -81,7 +81,8 @@ def _apply_inventory_closes(state):
             or closing.inventory_applied
         ):
             continue
-        remaining = closing.quantity
+        to_match = closing.offset_quantity
+        remaining = to_match
         if closing.closes_bundle_id:
             target = state.bundles.get(closing.closes_bundle_id)
             openings = [target] if target is not None else []
@@ -98,7 +99,7 @@ def _apply_inventory_closes(state):
         closing.inventory_applied = True
         print(
             f"BUNDLE INVENTORY | id={closing.bundle_id} "
-            f"matched_arb_lots={closing.quantity - remaining}/{closing.quantity} "
+            f"matched_arb_lots={to_match - remaining}/{to_match} "
             f"unmatched={remaining} (positions already filled)"
         )
 

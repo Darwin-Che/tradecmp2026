@@ -39,6 +39,7 @@ class TenderEvaluation:
     buffer_usd: float = 0.0
     expected_profit_usd: float = 0.0
     basket_profit_cad: float = 0.0
+    close_fee_reserve_cad: float = 0.0
     expected_profit_cad: float = 0.0
     edge_per_share_usd: float = 0.0
     projected_gross: int = 0
@@ -55,6 +56,7 @@ class TenderEvaluation:
             f"direct={self.direct_quantity} basket={self.basket_quantity} "
             f"direct_net={self.expected_profit_usd:+.2f}USD "
             f"basket_net={self.basket_profit_cad:+.2f}CAD | "
+            f"close_fee_reserve={self.close_fee_reserve_cad:.2f}CAD "
             f"net={self.expected_profit_cad:+.2f}CAD "
             f"edge={self.expected_profit_cad / self.quantity:+.4f}CAD"
             if self.quantity > 0 and self.route != "NONE"
@@ -151,6 +153,8 @@ def evaluate_fixed_tender(
     max_gross=500_000,
     min_net=-25_000,
     max_net=25_000,
+    max_residual_gross=None,
+    minimum_basket_edge_cad_per_share=0.0,
     now=None,
 ):
     """Choose the best feasible direct, basket, or hybrid tender exit."""
@@ -215,6 +219,7 @@ def evaluate_fixed_tender(
         return reject("tender acceptance would exceed net limit", **acceptance_risk)
 
     best = None
+    carry_cap_blocked = False
     for basket_quantity in _candidate_basket_quantities(
         quantity, (bull, bear, ritc),
     ):
@@ -230,6 +235,9 @@ def evaluate_fixed_tender(
             max_net,
         )
         if not safe:
+            continue
+        if max_residual_gross is not None and final_gross > max_residual_gross:
+            carry_cap_blocked = True
             continue
 
         direct_fill = estimate_fill(ritc, exit_action, direct_quantity)
@@ -273,7 +281,25 @@ def evaluate_fixed_tender(
         basket_net_cad = (
             basket_gross_cad - basket_fees_cad - basket_buffer_cad
         )
-        expected_profit_cad = direct_net_cad + basket_net_cad
+        # A basket route can leave positions to settle or close later. Reserve
+        # market-order fees for the *additional* residual inventory it creates.
+        final_positions = dict(state.positions)
+        final_positions["RITC"] = (
+            final_positions.get("RITC", 0) + tender_sign * basket_quantity
+        )
+        for ticker in ("BULL", "BEAR"):
+            final_positions[ticker] = (
+                final_positions.get(ticker, 0) - tender_sign * basket_quantity
+            )
+        close_fee_reserve_cad = sum(
+            max(0, abs(final_positions[ticker]) - abs(state.positions.get(ticker, 0)))
+            * (market_fee_usd * usd.best_ask if ticker == "RITC"
+               else stock_market_fee_cad)
+            for ticker in ("RITC", "BULL", "BEAR")
+        )
+        expected_profit_cad = (
+            direct_net_cad + basket_net_cad - close_fee_reserve_cad
+        )
 
         legs = []
         if direct_quantity:
@@ -305,13 +331,18 @@ def evaluate_fixed_tender(
             else "BASKET" if direct_quantity == 0
             else "HYBRID"
         )
+        basket_edge_blocked = (
+            basket_quantity > 0
+            and expected_profit_cad / quantity < minimum_basket_edge_cad_per_share
+        )
+        profitable = expected_profit_cad >= minimum_profit_cad
         candidate = TenderEvaluation(
             tender_id=tender_id,
-            should_accept=expected_profit_cad >= minimum_profit_cad,
+            should_accept=profitable and not basket_edge_blocked,
             reason=(
+                "profit below minimum" if not profitable else
+                "basket edge below minimum" if basket_edge_blocked else
                 "profitable after costs"
-                if expected_profit_cad >= minimum_profit_cad
-                else "profit below minimum"
             ),
             action=action,
             exit_action=exit_action,
@@ -329,6 +360,7 @@ def evaluate_fixed_tender(
             buffer_usd=direct_buffer_usd,
             expected_profit_usd=direct_net_usd,
             basket_profit_cad=basket_net_cad,
+            close_fee_reserve_cad=close_fee_reserve_cad,
             expected_profit_cad=expected_profit_cad,
             edge_per_share_usd=(
                 direct_net_usd / direct_quantity if direct_quantity else 0.0
@@ -336,12 +368,16 @@ def evaluate_fixed_tender(
             projected_gross=final_gross,
             projected_net=final_net,
         )
-        if best is None or candidate.expected_profit_cad > best.expected_profit_cad:
+        if (best is None
+                or (candidate.should_accept and not best.should_accept)
+                or (candidate.should_accept == best.should_accept
+                    and candidate.expected_profit_cad > best.expected_profit_cad)):
             best = candidate
 
     if best is None:
         return reject(
-            "insufficient executable depth or route capacity",
+            ("residual gross carry cap" if carry_cap_blocked
+             else "insufficient executable depth or route capacity"),
             **acceptance_risk,
         )
     return best

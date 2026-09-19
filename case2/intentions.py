@@ -91,6 +91,7 @@ class TradeBundle:
     max_unhedged_ticks: int
     quantity: int = 0
     open_quantity: int = 0
+    offset_quantity: int = 0
     closes_reason: Optional[str] = None
     closes_bundle_id: Optional[str] = None
     inventory_applied: bool = False

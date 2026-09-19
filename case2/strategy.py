@@ -78,6 +78,31 @@ PNL_GROSS_PROFILES = (
     (0.25, 0.10),
 )
 PNL_MAX_GIVEBACK_FRACTION = 0.20
+PNL_RECOVERY_GIVEBACK_FRACTION = 0.15
+PNL_DRAWDOWN_CONFIRM_TICKS = 2
+TENDER_MAX_CARRY_GROSS_FRACTION = float(
+    os.getenv("RIT_TENDER_MAX_CARRY_GROSS_FRACTION", "0.90")
+)
+TENDER_LATE_TICK = int(os.getenv("RIT_TENDER_LATE_TICK", "200"))
+TENDER_LATE_MAX_CARRY_GROSS_FRACTION = float(
+    os.getenv("RIT_TENDER_LATE_MAX_CARRY_GROSS_FRACTION", "0.60")
+)
+ENDGAME_HOLD_TICK = int(os.getenv("RIT_ENDGAME_HOLD_TICK", "270"))
+LOSS_GROWTH_BLOCK_CAD = float(
+    os.getenv("RIT_LOSS_GROWTH_BLOCK_CAD", "5000")
+)
+TENDER_MIN_BASKET_EDGE_CAD = float(
+    os.getenv("RIT_TENDER_MIN_BASKET_EDGE_CAD", "0.03")
+)
+if not (0 < TENDER_LATE_MAX_CARRY_GROSS_FRACTION
+        <= TENDER_MAX_CARRY_GROSS_FRACTION <= 1):
+    raise ValueError(
+        "tender carry gross fractions must satisfy 0 < late <= normal <= 1"
+    )
+if TENDER_LATE_TICK < 0 or ENDGAME_HOLD_TICK < 0:
+    raise ValueError("late and endgame ticks must be non-negative")
+if LOSS_GROWTH_BLOCK_CAD < 0 or TENDER_MIN_BASKET_EDGE_CAD < 0:
+    raise ValueError("loss guard and tender basket edge must be non-negative")
 TENDER_BUFFER_USD = 0.03
 TENDER_MIN_PROFIT_CAD = 50.0
 TENDER_MAX_BOOK_AGE = 1.5
@@ -155,6 +180,16 @@ def accept_active_tender_offers(client):
         return False
 
     candidates = []
+    carry_fraction = (
+        TENDER_LATE_MAX_CARRY_GROSS_FRACTION
+        if STATE.case_tick is not None and STATE.case_tick >= TENDER_LATE_TICK
+        else TENDER_MAX_CARRY_GROSS_FRACTION
+    )
+    carry_cap = max(
+        equity_gross(STATE.positions), int(MAX_GROSS * carry_fraction)
+    )
+    if STATE.loss_growth_guard_active:
+        carry_cap = equity_gross(STATE.positions)
     for offer in offers:
         tender_id = offer["tender_id"]
         if tender_id in ACCEPTED_TENDER_IDS:
@@ -170,6 +205,8 @@ def accept_active_tender_offers(client):
             max_gross=MAX_GROSS,
             min_net=MAX_SHORT_NET,
             max_net=MAX_LONG_NET,
+            max_residual_gross=carry_cap,
+            minimum_basket_edge_cad_per_share=TENDER_MIN_BASKET_EDGE_CAD,
         )
         decision_line = evaluation.log_line()
         if evaluation.should_accept:
@@ -202,6 +239,11 @@ def accept_active_tender_offers(client):
 
     tick = STATE.case_tick or 0
     bundle_id = f"tender-{tender_id}-exit"
+    tender_direction = "BUY_ETF" if evaluation.action == "BUY" else "SELL_ETF"
+    tender_offset = min(
+        evaluation.basket_quantity,
+        opposing_inventory_quantity(STATE.positions, tender_direction),
+    )
     tender = TenderState(
         tender_id=tender_id,
         action=evaluation.action,
@@ -226,6 +268,11 @@ def accept_active_tender_offers(client):
         expected_profit_cad=evaluation.expected_profit_cad,
         max_unhedged_ticks=MAX_UNHEDGED_TICKS,
         quantity=evaluation.quantity,
+        offset_quantity=tender_offset,
+        closes_reason=(
+            "ETF_ARB_SELL_ETF" if tender_direction == "BUY_ETF"
+            else "ETF_ARB_BUY_ETF"
+        ) if tender_offset else None,
         projected_gross=evaluation.projected_gross,
         projected_net=evaluation.projected_net,
         context=f"tender={tender_id} route={evaluation.route}",
@@ -290,18 +337,51 @@ def equity_gross(positions):
     )
 
 
+def opposing_inventory_quantity(positions, direction):
+    """Balanced shares that a three-leg trade would reduce, not open."""
+    bull = positions.get(BULL, 0)
+    bear = positions.get(BEAR, 0)
+    ritc = positions.get(RITC, 0)
+    if direction == "SELL_ETF":
+        return max(0, min(-bull, -bear, ritc))
+    if direction == "BUY_ETF":
+        return max(0, min(bull, bear, -ritc))
+    raise ValueError("direction must be BUY_ETF or SELL_ETF")
+
+
 def pnl_risk_profile():
     """Return gross start/target fractions and drawdown state."""
-    pnl = STATE.pnl_cad
+    pnl = STATE.risk_pnl_cad if STATE.risk_pnl_cad is not None else STATE.pnl_cad
     profile_index = sum(pnl >= threshold for threshold in PNL_THRESHOLDS_CAD)
-    drawdown_active = (
-        STATE.pnl_high_water_cad >= PNL_THRESHOLDS_CAD[0]
-        and pnl <= STATE.pnl_high_water_cad * (1 - PNL_MAX_GIVEBACK_FRACTION)
-    )
+    drawdown_active = STATE.pnl_drawdown_active
     if drawdown_active:
         profile_index = len(PNL_GROSS_PROFILES) - 1
     start, target = PNL_GROSS_PROFILES[profile_index]
     return start, target, drawdown_active
+
+
+def loss_growth_guard_active():
+    """Pause new gross exposure after a sustained loss from the heat baseline."""
+    if LOSS_GROWTH_BLOCK_CAD == 0:
+        return False
+    threshold = (
+        LOSS_GROWTH_BLOCK_CAD / 2
+        if STATE.loss_growth_guard_active else LOSS_GROWTH_BLOCK_CAD
+    )
+    return (
+        STATE.risk_pnl_cad is not None
+        and STATE.risk_pnl_cad <= -threshold
+    )
+
+
+def arb_plan_allowed(plan, gross, *, reducing=False):
+    """Allow profitable inventory offsets, but block growth under risk stress."""
+    if plan is None:
+        return False
+    if STATE.loss_growth_guard_active and plan.projected_gross > gross:
+        return False
+    inventory_guard = reducing or gross >= MAX_GROSS * pnl_risk_profile()[0]
+    return not (inventory_guard and plan.projected_gross >= gross)
 
 
 def inventory_reduction_plan():
@@ -347,6 +427,16 @@ def inventory_reduction_plan():
     )
     if plan is None:
         return None
+    if (STATE.case_tick is not None and STATE.case_tick >= ENDGAME_HOLD_TICK
+            and plan.expected_profit_cad < 0):
+        # Positions settle automatically; do not pay a spread merely to be flat.
+        if STATE.strategy_status != "HOLDING_TO_SETTLEMENT":
+            print(
+                f"ENDGAME HOLD | tick={STATE.case_tick} "
+                f"gross={gross} negative_close={plan.expected_profit_cad:+.2f}CAD"
+            )
+        STATE.strategy_status = "HOLDING_TO_SETTLEMENT"
+        return None
     STATE.strategy_status = "REDUCING_INVENTORY"
     return replace(plan, reason=f"INVENTORY_REDUCE_{direction}")
 
@@ -356,10 +446,22 @@ def enqueue_arb(plan, closes_bundle_id=None):
     tick = STATE.case_tick or 0
     bundle_id = f"arb-{tick}-{len(STATE.bundles) + 1}"
     is_opening = plan.reason.startswith("ETF_ARB_")
+    offset_quantity = 0
+    if is_opening:
+        direction = plan.reason.removeprefix("ETF_ARB_")
+        offset_quantity = min(
+            plan.quantity,
+            opposing_inventory_quantity(STATE.positions, direction),
+        )
     closes_reason = None
     source = STATE.bundles.get(closes_bundle_id)
     if source is not None:
         closes_reason = source.reason
+    elif is_opening and offset_quantity:
+        closes_reason = (
+            "ETF_ARB_BUY_ETF" if direction == "SELL_ETF"
+            else "ETF_ARB_SELL_ETF"
+        )
     elif plan.reason.endswith("BUY_ETF") and not is_opening:
         closes_reason = "ETF_ARB_SELL_ETF"
     elif plan.reason.endswith("SELL_ETF") and not is_opening:
@@ -371,7 +473,8 @@ def enqueue_arb(plan, closes_bundle_id=None):
         expected_profit_cad=plan.expected_profit_cad,
         max_unhedged_ticks=MAX_UNHEDGED_TICKS,
         quantity=plan.quantity,
-        open_quantity=plan.quantity if is_opening else 0,
+        open_quantity=plan.quantity - offset_quantity if is_opening else 0,
+        offset_quantity=offset_quantity if is_opening else plan.quantity,
         closes_reason=closes_reason,
         closes_bundle_id=closes_bundle_id,
         gross_profit_cad=plan.gross_profit_cad,
@@ -408,6 +511,7 @@ def enqueue_arb(plan, closes_bundle_id=None):
         f"gross={plan.gross_profit_cad:+.2f}CAD fees={plan.fees_cad:.2f}CAD "
         f"net={plan.expected_profit_cad:+.2f}CAD "
         f"edge={plan.edge_per_share_cad:+.4f}CAD "
+        f"offset={bundle.offset_quantity} opening={bundle.open_quantity} "
         f"risk_gross={plan.projected_gross} risk_net={plan.projected_net}"
     )
     return bundle
@@ -428,15 +532,35 @@ def step_once(client):
 
     pos = positions_map(client)
     STATE.update_positions(pos)
-    STATE.update_portfolio_value(
-        liquidation_value_cad(STATE.positions, STATE.current_books)
-    )
-    risk_start, risk_target, drawdown = pnl_risk_profile()
     previous_profile = (
         STATE.gross_start_fraction,
         STATE.gross_target_fraction,
         STATE.pnl_drawdown_active,
     )
+    portfolio_mark = liquidation_value_cad(STATE.positions, STATE.current_books)
+    STATE.update_portfolio_value(portfolio_mark)
+    risk_mark_eligible = (
+        portfolio_mark is not None
+        and not STATE.active_intents()
+        and not any(bundle.status in ("HEDGING", "INCOMPLETE")
+                    for bundle in STATE.bundles.values())
+    )
+    STATE.update_risk_mark(
+        STATE.case_tick, eligible=risk_mark_eligible,
+        giveback_fraction=PNL_MAX_GIVEBACK_FRACTION,
+        recovery_fraction=PNL_RECOVERY_GIVEBACK_FRACTION,
+        confirmation_ticks=PNL_DRAWDOWN_CONFIRM_TICKS,
+        minimum_high_water=PNL_THRESHOLDS_CAD[0],
+    )
+    loss_guard = loss_growth_guard_active()
+    if loss_guard != STATE.loss_growth_guard_active:
+        print(
+            f"LOSS GROWTH GUARD | tick={STATE.case_tick} "
+            f"active={loss_guard} risk_pnl={STATE.risk_pnl_cad:+.2f}CAD "
+            f"threshold={-LOSS_GROWTH_BLOCK_CAD:+.2f}CAD"
+        )
+        STATE.loss_growth_guard_active = loss_guard
+    risk_start, risk_target, drawdown = pnl_risk_profile()
     STATE.update_risk_profile(risk_start, risk_target, drawdown)
     if previous_profile != (risk_start, risk_target, drawdown):
         mark = liquidation_components_cad(STATE.positions, STATE.current_books)
@@ -446,10 +570,11 @@ def step_once(client):
             f"bear={mark['bear']:+.2f} usd_block={mark['usd_block']:+.2f}"
         )
         print(
-            f"RISK PROFILE | tick={STATE.case_tick} pnl={STATE.pnl_cad:+.2f}CAD "
-            f"high_water={STATE.pnl_high_water_cad:+.2f}CAD "
-            f"giveback_trigger={STATE.pnl_high_water_cad * (1 - PNL_MAX_GIVEBACK_FRACTION):+.2f}CAD "
-            f"giveback_eligible={STATE.pnl_high_water_cad >= PNL_THRESHOLDS_CAD[0]} "
+            f"RISK PROFILE | tick={STATE.case_tick} mark_pnl={STATE.pnl_cad:+.2f}CAD "
+            f"risk_pnl={STATE.risk_pnl_cad if STATE.risk_pnl_cad is not None else 0:+.2f}CAD "
+            f"risk_high={STATE.risk_high_water_cad:+.2f}CAD "
+            f"giveback_trigger={STATE.risk_high_water_cad * (1 - PNL_MAX_GIVEBACK_FRACTION):+.2f}CAD "
+            f"stable_mark={risk_mark_eligible} "
             f"gross_now={equity_gross(STATE.positions)}/{MAX_GROSS} "
             f"gross={risk_start:.0%}->{risk_target:.0%} "
             f"gross_band={int(MAX_GROSS * risk_start)}->{int(MAX_GROSS * risk_target)} "
@@ -516,6 +641,11 @@ def step_once(client):
             max_gross=MAX_GROSS,
             min_net=MAX_SHORT_NET,
             max_net=MAX_LONG_NET,
+            minimum_close_profit_cad=(
+                0.0 if STATE.case_tick is not None
+                and STATE.case_tick >= ENDGAME_HOLD_TICK
+                else float("-inf")
+            ),
         )
         plan = None
         if exit_choice is not None:
@@ -528,7 +658,9 @@ def step_once(client):
             )
         if plan is None:
             plan = inventory_reduction_plan()
-        reducing = STATE.strategy_status == "REDUCING_INVENTORY"
+        reducing = STATE.strategy_status in (
+            "REDUCING_INVENTORY", "HOLDING_TO_SETTLEMENT"
+        )
         if plan is None:
             plan = best_arbitrage(
                 STATE,
@@ -540,10 +672,7 @@ def step_once(client):
                 min_net=MAX_SHORT_NET,
                 max_net=MAX_LONG_NET,
             )
-            inventory_guard = (
-                reducing or gross >= MAX_GROSS * pnl_risk_profile()[0]
-            )
-            if plan and inventory_guard and plan.projected_gross >= gross:
+            if not arb_plan_allowed(plan, gross, reducing=reducing):
                 plan = None
         if plan is not None:
             enqueue_arb(plan, closes_bundle_id=closes_bundle_id)
