@@ -179,6 +179,34 @@ def test_live_pair_uses_confirmed_partial_fill(monkeypatch):
     assert sent == [('RTM100P', 10), ('RTM100C', 3)]
 
 
+def test_terminal_fill_waits_for_position_snapshot(monkeypatch):
+    monkeypatch.setattr(s.time, 'sleep', lambda _: None)
+    broker = s.Broker(Mock())
+    row = rows()[1]
+    broker.order = Mock(return_value=2)
+    broker.get = Mock(side_effect=[
+        [dict(row)],
+        [dict(row, position=2)],
+    ])
+
+    assert broker.confirmed_order(row, 2) == 2
+    broker.order.assert_called_once_with(row, 2)
+    assert broker.get.call_count == 2
+
+
+def test_persistent_position_mismatch_stops_without_resubmitting(monkeypatch):
+    monkeypatch.setattr(s.time, 'sleep', lambda _: None)
+    broker = s.Broker(Mock())
+    row = rows()[1]
+    broker.order = Mock(return_value=2)
+    broker.get = Mock(return_value=[dict(row, position=1)])
+
+    with pytest.raises(RuntimeError, match='expected 2, observed 1'):
+        broker.confirmed_order(row, 2)
+    broker.order.assert_called_once_with(row, 2)
+    assert broker.get.call_count == s.POSITION_RECONCILE_ATTEMPTS
+
+
 def test_uncertain_post_is_not_retried(monkeypatch):
     monkeypatch.setattr(s, 'DRY_RUN', False)
     session = Mock()
@@ -1021,11 +1049,10 @@ def test_announced_delta_limit_is_read_from_matching_news_period():
     assert s.announced_delta_limit_from_news([],2) is None
 
 
-def test_delta_limit_selection_has_no_default():
-    assert s.choose_announced_delta_limit(None) is None
+def test_delta_limit_selection_defaults_to_7000_unless_news_or_override():
+    assert s.choose_announced_delta_limit(None) == 7000
     assert s.choose_announced_delta_limit(5000)==5000
-    assert s.choose_announced_delta_limit(None,prompt=lambda _: '5,000')==5000
-    assert s.choose_announced_delta_limit(None,prompt=lambda _: '') is None
+    assert s.choose_announced_delta_limit(None,supplied=6000)==6000
     with pytest.raises(ValueError,match='differs'):
         s.choose_announced_delta_limit(5000,supplied=7000)
 

@@ -1,4 +1,4 @@
-"""Event-driven Case 1 strategy; reads or prompts for sub-heat delta limit.
+"""Event-driven Case 1 strategy; defaults to a 7000 delta limit.
 
 DRY_RUN prints orders against actual account positions; it does not simulate fills.
 Baseline observations must precede release ticks. Starting mid-case can therefore
@@ -9,7 +9,6 @@ import time
 import argparse
 import json
 import re
-import sys
 from pathlib import Path
 from dataclasses import dataclass, field
 
@@ -19,7 +18,7 @@ from case1_simple import (api_get, parse_news,
                           news_identity, number, option_identity, valid_security,
                           black_scholes)
 
-API_ENDPOINT = "http://flserver.rotman.utoronto.ca:16595/v1"  # Volatility Trading case
+API_ENDPOINT = "http://flserver.rotman.utoronto.ca:16655/v1"  # Volatility Trading case
 USERNAME = "goal-2"
 PASSWORD = "credit"
 
@@ -38,6 +37,8 @@ PAIR_COMPLETION_ATTEMPTS = 3
 PAIR_COMPLETION_SECONDS = 6.0
 PAIR_ROLLBACK_ATTEMPTS = 4
 ENTRY_REFRESH_ATTEMPTS = 3
+POSITION_RECONCILE_ATTEMPTS = 3
+POSITION_RECONCILE_DELAY_SECONDS = 0.2
 TOTAL_TICKS = 300
 TOTAL_WEEKS = 4
 TICKS_PER_WEEK = 75
@@ -78,6 +79,7 @@ GAMMA_DELTA_BUDGET = MAX_3SIGMA_DELTA_SHOCK
 SOFT_DELTA_LIMIT = 3500
 HARD_DELTA_LIMIT = 6000
 OFFICIAL_DELTA_LIMIT = 7000
+DEFAULT_DELTA_LIMIT = 7000
 MOVE_SIGMAS = 3.0
 LONG_VOL_HEDGE_BAND = 1300
 SHORT_VOL_HEDGE_BAND = 800
@@ -1124,11 +1126,22 @@ class Broker:
     def confirmed_order(self, row, change):
         self.last_fill = None
         filled = self.order(row, change)
-        after = self.get('/securities')
-        actual = next(r['position'] for r in after if r['ticker'] == row['ticker'])
         expected = row['position'] + (filled if change > 0 else -filled)
-        if actual != expected:
-            raise RuntimeError('Positions disagree with fills; stop and reconcile')
+        # The order endpoint can report a terminal fill before /securities catches up.
+        # Retry only the account read; never submit the same order again.
+        for attempt in range(POSITION_RECONCILE_ATTEMPTS):
+            after = self.get('/securities')
+            actual = next((r['position'] for r in after if r['ticker'] == row['ticker']), None)
+            if actual == expected:
+                break
+            if attempt + 1 < POSITION_RECONCILE_ATTEMPTS:
+                time.sleep(POSITION_RECONCILE_DELAY_SECONDS)
+        else:
+            record_event('position_fill_mismatch', ticker=row['ticker'],
+                         expected=expected, actual=actual, filled=filled,
+                         attempted_change=change)
+            raise RuntimeError(f'Positions disagree with fills for {row["ticker"]}: '
+                               f'expected {expected}, observed {actual}; stop and reconcile')
         if self.ledger is not None:
             detail = self.last_fill or dict(price=float(row['ask'] if change > 0 else row['bid']),
                                            source='limit_estimate', order_id=None)
@@ -1376,18 +1389,15 @@ def announced_delta_limit_from_news(items, period=None):
     return limits[-1] if limits else None
 
 
-def choose_announced_delta_limit(published, supplied=None, prompt=None):
-    """Require a sub-heat-specific value; never substitute a built-in default."""
+def choose_announced_delta_limit(published, supplied=None):
+    """Use the published limit, an explicit override, or the 7000 default."""
     if published is not None and supplied is not None and published != supplied:
         raise ValueError('Configured delta limit differs from sub-heat news')
     if published is not None:
         return published
     if supplied is not None:
         return supplied
-    if prompt is None:
-        return None
-    value=prompt('Enter the announced delta limit for this sub-heat (blank to wait): ').strip()
-    return int(value.replace(',','')) if value else None
+    return DEFAULT_DELTA_LIMIT
 
 
 def log_configuration():
@@ -1411,7 +1421,7 @@ def main(announced_delta_limit=None):
             raise ValueError('Provide the announced sub-heat delta limit (>1000)')
     print(f'Integrated-variance strategy | DRY_RUN={DRY_RUN} | '
           f'AUTO_ENTRIES={AUTO_ENTRIES} | AUTO_SIGNAL_EXITS={AUTO_SIGNAL_EXITS} | '
-          'DELTA_LIMIT=awaiting sub-heat value')
+          f'DELTA_LIMIT_DEFAULT={DEFAULT_DELTA_LIMIT}')
     strategy = Strategy()
     with requests.Session() as session:
         session.auth = (USERNAME, PASSWORD)
@@ -1420,7 +1430,6 @@ def main(announced_delta_limit=None):
         previous_active = None
         configured_period = None
         configured_limit = None
-        waiting_limit_period = None
         try:
             while True:
                 case = broker.get('/case')
@@ -1432,7 +1441,6 @@ def main(announced_delta_limit=None):
                         broker.ledger = ledger
                         configured_period = None
                         configured_limit = None
-                        waiting_limit_period = None
                         announced_delta_limit = None  # Never carry an old sub-heat's manual value forward.
                     previous_active = current
                     if case.get('tick', 0) >= TOTAL_TICKS:
@@ -1443,22 +1451,10 @@ def main(announced_delta_limit=None):
                     published_limit=announced_delta_limit_from_news(news,case.get('period'))
                     if configured_period != case.get('period'):
                         supplied = announced_delta_limit if configured_period is None else None
-                        try:
-                            limit=choose_announced_delta_limit(
-                                published_limit,supplied,
-                                input if sys.stdin.isatty() else None)
-                        except EOFError:
-                            limit=None
-                        if limit is None:
-                            if waiting_limit_period != case.get('period'):
-                                print('Waiting for announced delta limit; no orders will be sent.',flush=True)
-                                waiting_limit_period=case.get('period')
-                            time.sleep(POLL_SECONDS)
-                            continue
+                        limit=choose_announced_delta_limit(published_limit,supplied)
                         configure_announced_delta_limit(limit)
                         configured_period=case.get('period')
                         configured_limit=limit
-                        waiting_limit_period=None
                         print(f'Configured sub-heat delta limit={limit}; '
                               f'hard={HARD_DELTA_LIMIT}, emergency={EMERGENCY_DELTA}',flush=True)
                         log_configuration()
@@ -1488,7 +1484,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--replay', metavar='JSONL', help='offline decision replay, no orders')
     parser.add_argument('--announced-delta-limit', type=int,
-                        help='optional explicit sub-heat value; otherwise read news or prompt')
+                        help='optional explicit sub-heat value; otherwise use news or default to 7000')
     args = parser.parse_args()
     if args.replay:
         replay(args.replay)
